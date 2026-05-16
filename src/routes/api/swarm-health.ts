@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import * as yaml from 'yaml'
 import { isAuthenticated } from '../../server/auth-middleware'
 import { getLocalBinDir, getProfilesDir } from '../../server/claude-paths'
+import { readSwarmRoster } from '../../server/swarm-roster'
 
 type WorkerHealth = {
   workerId: string
@@ -49,7 +50,6 @@ function readWorkerConfig(profilePath: string): { model: string; provider: strin
   }
 }
 
-
 function formatModelDisplay(model: string, provider: string): string {
   const value = `${model} ${provider}`.toLowerCase()
   if (value.includes('claude-opus-4-7') || value.includes('opus-4-7')) return 'Opus 4.7'
@@ -57,14 +57,16 @@ function formatModelDisplay(model: string, provider: string): string {
   if (value.includes('gpt-5.5')) return 'GPT-5.5'
   if (value.includes('gpt-5.4')) return 'GPT-5.4'
   if (value.includes('gpt-5.3')) return 'GPT-5.3'
-  return model === 'unknown' ? provider : model
+  if (model && model !== 'unknown') return model
+  if (provider && provider !== 'unknown') return provider.replace(/^custom:/, '').replace(/[-_]/g, ' ')
+  return ''
 }
 
 function formatProviderDisplay(provider: string): string {
   const value = provider.toLowerCase()
   if (value.includes('anthropic-billing-proxy')) return 'Anthropic Opus'
   if (value.includes('openai-codex')) return 'OpenAI Codex'
-  if (value === 'unknown') return 'Unknown'
+  if (value === 'unknown' || value === 'roster-only') return ''
   return provider.replace(/^custom:/, '').replace(/[-_]/g, ' ')
 }
 
@@ -95,7 +97,6 @@ function scanRecentAuthErrors(profilePath: string): {
       lastMessage = line.slice(0, 320)
     }
     if (count === 0) {
-      // Honor last-modified file timestamp as a hint if no parseable lines but file changed recently.
       if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000) {
         // Leave count 0; UI shows fresh log activity separately if needed.
       }
@@ -114,13 +115,17 @@ export const Route = createFileRoute('/api/swarm-health')({
           return json({ error: 'Unauthorized' }, { status: 401 })
         }
 
-        const workspaceModel = formatModelDisplay(process.env.HERMES_DEFAULT_MODEL ?? process.env.CLAUDE_DEFAULT_MODEL ?? 'unknown', (process.env.HERMES_API_URL ?? process.env.CLAUDE_API_URL)?.includes('anthropic') ? 'anthropic' : 'unknown')
+        const workspaceModel = formatModelDisplay(
+          process.env.HERMES_DEFAULT_MODEL ?? process.env.CLAUDE_DEFAULT_MODEL ?? 'unknown',
+          (process.env.HERMES_API_URL ?? process.env.CLAUDE_API_URL)?.includes('anthropic') ? 'anthropic' : 'unknown',
+        )
         const apiUrl = process.env.HERMES_API_URL ?? process.env.CLAUDE_API_URL ?? null
         const profilesBase = getProfilesDir()
-        const swarmIds = listSwarmIds()
         const wrapperBase = getLocalBinDir()
+        const swarmIds = listSwarmIds()
 
-        const workers: WorkerHealth[] = swarmIds.map((id) => {
+        // Build worker list from profile directories (real health data)
+        const profileWorkers: WorkerHealth[] = swarmIds.map((id) => {
           const profilePath = join(profilesBase, id)
           const wrapperPath = join(wrapperBase, id)
           const config = readWorkerConfig(profilePath)
@@ -137,9 +142,35 @@ export const Route = createFileRoute('/api/swarm-health')({
           }
         })
 
+        // If no profiles found, fall back to roster (swarm.yaml) so the UI always
+        // shows the configured workers even when profile directories don't exist yet.
+        let rosterWorkers: WorkerHealth[] = []
+        if (swarmIds.length === 0) {
+          try {
+            const roster = readSwarmRoster()
+            rosterWorkers = roster.workers.map((w) => ({
+              workerId: w.id,
+              profileFound: false,
+              wrapperFound: false,
+              model: w.model ?? 'unknown',
+              provider: 'roster-only',
+              recentAuthErrors: 0,
+              lastErrorAt: null,
+              lastErrorMessage: null,
+            }))
+          } catch {
+            // Roster read failed — continue with empty fallback
+          }
+        }
+
+        const workers = swarmIds.length > 0 ? profileWorkers : rosterWorkers
         const totalAuthErrors = workers.reduce((sum, worker) => sum + worker.recentAuthErrors, 0)
-        const distinctModels = Array.from(new Set(workers.map((w) => formatModelDisplay(w.model, w.provider)))).filter((value) => value !== 'unknown')
-        const distinctProviders = Array.from(new Set(workers.map((w) => formatProviderDisplay(w.provider)))).filter((value) => value !== 'unknown')
+        const distinctModels = Array.from(
+          new Set(workers.map((w) => formatModelDisplay(w.model, w.provider))),
+        ).filter((value) => value !== '')
+        const distinctProviders = Array.from(
+          new Set(workers.map((w) => formatProviderDisplay(w.provider))),
+        ).filter((value) => value !== '')
 
         return json({
           checkedAt: Date.now(),

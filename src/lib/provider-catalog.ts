@@ -157,6 +157,48 @@ export const PROVIDER_CATALOG: Array<ProviderInfo> = [
       2,
     ),
   },
+  {
+    id: 'ollama-cloud',
+    name: 'Ollama Cloud',
+    description: 'Hosted Ollama models on ollama.com — no GPU required.',
+    authTypes: ['api-key'],
+    docsUrl: 'https://ollama.com/settings/keys',
+    configExample: JSON.stringify(
+      {
+        auth: {
+          profiles: {
+            'ollama-cloud:default': {
+              provider: 'ollama-cloud',
+              apiKey: 'your-ollama-cloud-key',
+            },
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  },
+  {
+    id: 'opencode-go',
+    name: 'OpenCode Go',
+    description: 'Unified access to Chinese AI models via OpenCode Go membership.',
+    authTypes: ['api-key'],
+    docsUrl: 'https://opencode.ai',
+    configExample: JSON.stringify(
+      {
+        auth: {
+          profiles: {
+            'opencode-go:default': {
+              provider: 'opencode-go',
+              apiKey: 'your-opencode-go-key',
+            },
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  },
 ]
 
 export function normalizeProviderId(value: string): string {

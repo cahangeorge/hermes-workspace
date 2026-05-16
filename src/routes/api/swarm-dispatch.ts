@@ -8,7 +8,7 @@ import { isAuthenticated } from '../../server/auth-middleware'
 import { newestCheckpointFromMessages, type ParsedSwarmCheckpoint } from '../../server/swarm-checkpoints'
 import { readWorkerMessages } from '../../server/swarm-chat-reader'
 import { createOrUpdateMission, markMissionAssignmentDispatched, recordMissionCheckpoint } from '../../server/swarm-missions'
-import { appendSwarmMemoryEvent } from '../../server/swarm-memory'
+import { appendSwarmMemoryEvent, buildSwarmStartupSnapshot } from '../../server/swarm-memory'
 import { rosterByWorkerId, type SwarmRosterWorker } from '../../server/swarm-roster'
 import { publishSwarmCheckpointNotification } from '../../server/swarm-notifications'
 
@@ -334,7 +334,7 @@ export function checkpointFromRuntimeSnapshot(snapshot: RuntimeCheckpointSnapsho
   return checkpoint
 }
 
-function buildWorkerPrompt(input: {
+async function buildWorkerPrompt(input: {
   workerId: string
   task: string
   rationale?: string
@@ -342,7 +342,7 @@ function buildWorkerPrompt(input: {
   direct?: boolean
   missionId?: string | null
   taskTitle?: string | null
-}): string {
+}): Promise<string> {
   if (input.direct) return input.task
   const roster = input.roster
   const role = roster?.role || 'Worker'
@@ -353,7 +353,7 @@ function buildWorkerPrompt(input: {
 
   let snapshotSection = ''
   try {
-    const snapshot = buildSwarmStartupSnapshot({
+    const snapshot = await buildSwarmStartupSnapshot({
       workerId: input.workerId,
       role,
       specialty,
@@ -632,10 +632,10 @@ async function sendPromptToLiveSession(workerId: string, prompt: string): Promis
   }
 }
 
-function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: SwarmRosterWorker | undefined, options?: { waitForCheckpoint?: boolean; checkpointPollMs?: number; missionId?: string | null; notifySessionKey?: string | null }): Promise<WorkerResult> {
+async function runWorker(assignment: AssignmentRequest, timeoutMs: number, roster: SwarmRosterWorker | undefined, options?: { waitForCheckpoint?: boolean; checkpointPollMs?: number; missionId?: string | null; notifySessionKey?: string | null }): Promise<WorkerResult> {
   return new Promise(async (resolve) => {
     const workerId = assignment.workerId
-    const prompt = buildWorkerPrompt({
+    const prompt = await buildWorkerPrompt({
       workerId,
       task: assignment.task,
       rationale: assignment.rationale,

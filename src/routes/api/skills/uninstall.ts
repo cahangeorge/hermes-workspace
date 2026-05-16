@@ -3,13 +3,10 @@ import { json } from '@tanstack/react-start'
 import { isAuthenticated } from '../../../server/auth-middleware'
 import {
   BEARER_TOKEN,
-  CLAUDE_API,
   ensureGatewayProbed,
+  dashboardFetch,
+  CLAUDE_DASHBOARD_URL,
 } from '../../../server/gateway-capabilities'
-
-function authHeaders(): Record<string, string> {
-  return BEARER_TOKEN ? { Authorization: `Bearer ${BEARER_TOKEN}` } : {}
-}
 
 export const Route = createFileRoute('/api/skills/uninstall')({
   server: {
@@ -32,23 +29,21 @@ export const Route = createFileRoute('/api/skills/uninstall')({
           }
 
           const capabilities = await ensureGatewayProbed()
-          if (capabilities.dashboard.available) {
+          if (!capabilities.dashboard.available) {
             return json(
               {
                 ok: false,
                 error:
-                  'Skill uninstall is only available on the legacy enhanced fork right now.',
+                  `Dashboard is not available at ${CLAUDE_DASHBOARD_URL}. ` +
+                  'Start it with `hermes dashboard` to enable skill install/uninstall.',
               },
-              { status: 501 },
+              { status: 503 },
             )
           }
 
-          const response = await fetch(`${CLAUDE_API}/api/skills/uninstall`, {
+          const response = await dashboardFetch('/api/skills/uninstall', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...authHeaders(),
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name }),
             signal: AbortSignal.timeout(30_000),
           })

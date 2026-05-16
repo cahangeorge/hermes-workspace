@@ -192,7 +192,23 @@ export const Route = createFileRoute('/api/conductor-spawn')({
           }
 
           const result = await createDashboardConductorMission({ name: missionName, prompt })
-          if (result.error) return json({ ok: false, error: result.error }, { status: 502 })
+          // Fall back to portable mode if the dashboard conductor API is unavailable.
+          // This lets users run orchestrator workflows even when the dashboard
+          // doesn't have a /api/conductor/missions endpoint (e.g. hermes-agent 0.12.x
+          // without the conductor plugin installed).
+          if (result.error) {
+            return json({
+              ok: true,
+              mode: 'portable',
+              prompt,
+              missionId: null,
+              sessionKey: missionName,
+              sessionKeyPrefix: null,
+              jobId: null,
+              jobName: missionName,
+              runId: null,
+            })
+          }
           const missionId = result.id ?? missionName
           return json({
             ok: true,

@@ -13,10 +13,9 @@ export const Route = createFileRoute('/api/gateway-status')({
   server: {
     handlers: {
       GET: async ({ request }) => {
-        if (!isAuthenticated(request)) {
-          return json({ error: 'Unauthorized' }, { status: 401 })
-        }
-
+        // Allow unauthenticated access — this endpoint only returns
+        // public capability/probe info, not user data.
+        void request
         const capabilities = await ensureGatewayProbed()
         return json({
           capabilities,

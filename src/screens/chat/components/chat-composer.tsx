@@ -1,4 +1,5 @@
 import { createPortal } from 'react-dom'
+import { getModelCapabilities } from '@/utils/model-capabilities'
 import {
   Add01Icon,
   ArrowDown01Icon,
@@ -2259,6 +2260,7 @@ function ChatComposerComponent({
                             const isActive =
                               entry.id === currentModel ||
                               `${defaultProvider}/${entry.id}` === currentModel
+                            const capabilities = getModelCapabilities(entry.id)
                             return (
                               <div
                                 key={entry.id}
@@ -2282,6 +2284,18 @@ function ChatComposerComponent({
                                   <span className="flex-1 truncate">
                                     {entry.name}
                                   </span>
+                                  {capabilities.map((cap) => (
+                                    <span
+                                      key={cap.label}
+                                      className={cn(
+                                        'text-[9px] px-1 py-0.5 rounded-full font-medium shrink-0',
+                                        cap.pillClass,
+                                      )}
+                                      title={cap.label}
+                                    >
+                                      {cap.emoji} {cap.label}
+                                    </span>
+                                  ))}
                                   {entry.isLocal && (
                                     <span className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded-full bg-neutral-100 dark:bg-neutral-800">
                                       local
@@ -2490,10 +2504,11 @@ function ChatComposerComponent({
                                   ? defaultProvider
                                   : ((m as Record<string, unknown>)
                                       .provider as string) || defaultProvider
+                              const LOCAL_PROVIDER_IDS = ['ollama', 'atomic-chat']
                               const isLocal =
-                                typeof m !== 'string' &&
+                                (typeof m !== 'string' &&
                                 (m as Record<string, unknown>).description ===
-                                  'local'
+                                  'local') || LOCAL_PROVIDER_IDS.includes(mProvider)
                               return {
                                 id: mId,
                                 name: mName,
@@ -2520,6 +2535,7 @@ function ChatComposerComponent({
                                 entry.id === currentModel ||
                                 `${defaultProvider}/${entry.id}` ===
                                   currentModel
+                              const capabilities = getModelCapabilities(entry.id)
                               return (
                                 <div
                                   key={entry.id}
@@ -2543,6 +2559,18 @@ function ChatComposerComponent({
                                     <span className="flex-1 truncate">
                                       {entry.name}
                                     </span>
+                                    {capabilities.map((cap) => (
+                                      <span
+                                        key={cap.label}
+                                        className={cn(
+                                          'text-[9px] px-1 py-0.5 rounded-full font-medium shrink-0',
+                                          cap.pillClass,
+                                        )}
+                                        title={cap.label}
+                                      >
+                                        {cap.emoji} {cap.label}
+                                      </span>
+                                    ))}
                                     {entry.isLocal && (
                                       <span className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded-full bg-neutral-100 dark:bg-neutral-700">
                                         local

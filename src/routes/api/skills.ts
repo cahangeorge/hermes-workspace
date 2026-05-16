@@ -4,6 +4,7 @@ import { isAuthenticated } from '../../server/auth-middleware'
 import {
   BEARER_TOKEN,
   CLAUDE_API,
+  CLAUDE_DASHBOARD_URL,
   CLAUDE_UPGRADE_INSTRUCTIONS,
   dashboardFetch,
   ensureGatewayProbed,
@@ -385,39 +386,35 @@ export const Route = createFileRoute('/api/skills')({
             }
           }
 
-          if (capabilities.dashboard.available) {
-            if (action !== 'toggle') {
+          if (!capabilities.dashboard.available) {
+            if (action === 'toggle') {
               return json(
                 {
                   ok: false,
                   error:
-                    'Skill install/uninstall is only available on the legacy enhanced fork right now. Zero-fork mode supports listing and toggling installed skills.',
+                    `Dashboard is not available at ${CLAUDE_DASHBOARD_URL}. ` +
+                    'Start it with `hermes dashboard` to enable skill management.',
                 },
-                { status: 501 },
+                { status: 503 },
               )
             }
-
-            const response = await dashboardFetch('/api/skills/toggle', {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload),
-              signal: AbortSignal.timeout(30_000),
-            })
-
-            const result = await response.json()
-            return json(result, { status: response.status })
+            return json(
+              {
+                ok: false,
+                error:
+                  `Dashboard is not available at ${CLAUDE_DASHBOARD_URL}. ` +
+                  'Start it with `hermes dashboard` to enable skill install/uninstall.',
+              },
+              { status: 503 },
+            )
           }
 
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-          }
-          if (BEARER_TOKEN) headers['Authorization'] = `Bearer ${BEARER_TOKEN}`
-
-          const response = await fetch(`${CLAUDE_API}${endpoint}`, {
-            method: 'POST',
-            headers,
+          // Dashboard is available — route all actions through it.
+          const response = await dashboardFetch(endpoint, {
+            method: action === 'toggle' ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(120_000),
+            signal: AbortSignal.timeout(action === 'toggle' ? 30_000 : 120_000),
           })
 
           const result = await response.json()

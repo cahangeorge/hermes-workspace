@@ -5,6 +5,9 @@ import YAML from 'yaml'
 import type { ParsedSwarmCheckpoint } from './swarm-checkpoints'
 import { SWARM_CANONICAL_REPO } from './swarm-environment'
 
+const OPENVIKING_BASE = 'http://localhost:19333'
+const OPENVIKING_QUERY_TIMEOUT_MS = 8000
+
 export type SwarmMemoryKind = 'profile' | 'mission' | 'episodic' | 'handoff' | 'shared'
 
 export type SwarmMemoryEventType =
@@ -411,6 +414,37 @@ export function searchSwarmMemory(input: { workerId?: string | null; query: stri
 // Startup snapshot helpers
 // ---------------------------------------------------------------------------
 
+// Fetch memories from OpenViking server (contextual recall at session start)
+async function fetchOpenVikingMemory(query: string, limit = 5): Promise<string> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), OPENVIKING_QUERY_TIMEOUT_MS)
+    const res = await fetch(`${OPENVIKING_BASE}/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, limit }),
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    if (!res.ok) return ''
+    const json = (await res.json()) as { results?: Array<{ content?: string }> }
+    if (!json.results?.length) return ''
+    return json.results
+      .map((r) => r.content ?? '')
+      .filter(Boolean)
+      .join('\n\n')
+  } catch {
+    return ''
+  }
+}
+
+// Soft caps so the inline snapshot does not blow up dispatch envelopes.
+const maxIdentityChars = 600
+const maxMemoryChars = 1600
+const maxMissionChars = 1600
+const maxEpisodeChars = 600
+const maxProjectChars = 1200
+
 function tail(content: string, max: number): string {
   if (!content) return ''
   if (content.length <= max) return content.trim()
@@ -490,10 +524,11 @@ export type SwarmStartupSnapshot = {
   activeMission: { missionId: string; summary: string; recentEvents: Array<string> } | null
   latestHandoff: { path: string; content: string } | null
   latestEpisode: { date: string; content: string } | null
+  openVikingMemory: string
   rendered: string
 }
 
-export function buildSwarmStartupSnapshot(input: SwarmStartupSnapshotInput): SwarmStartupSnapshot {
+export async function buildSwarmStartupSnapshot(input: SwarmStartupSnapshotInput): Promise<SwarmStartupSnapshot> {
   const { workerId } = input
   if (!validateSwarmId(workerId)) throw new Error(`Invalid workerId: ${workerId}`)
   const identity = readTextIfExists(join(swarmWorkerMemoryRoot(workerId), 'IDENTITY.md'))
@@ -571,6 +606,24 @@ export function buildSwarmStartupSnapshot(input: SwarmStartupSnapshotInput): Swa
     renderedSections.push(`### Latest episode (${latestEpisode.date})`)
     renderedSections.push(tail(latestEpisode.content, maxEpisode))
   }
+
+  // Build the contextual query from available inputs
+  const ovQuery = [
+    workerId,
+    input.rosterMission,
+    input.taskTitle,
+    activeMission?.missionId,
+    input.specialty,
+    input.role,
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const openVikingMemory = await fetchOpenVikingMemory(ovQuery, 5)
+  if (openVikingMemory) {
+    renderedSections.push('### OpenViking contextual memory')
+    renderedSections.push(tail(openVikingMemory, maxMemory))
+  }
+
   renderedSections.push('### Memory locations')
   renderedSections.push(
     [
@@ -593,6 +646,7 @@ export function buildSwarmStartupSnapshot(input: SwarmStartupSnapshotInput): Swa
     activeMission,
     latestHandoff,
     latestEpisode,
+    openVikingMemory,
     rendered: renderedSections.join('\n\n'),
   }
 }

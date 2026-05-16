@@ -314,11 +314,14 @@ function RootLayout() {
       handleOnboardingCompleteChanged,
     )
 
-    void unregisterServiceWorkers({
-      serviceWorker:
-        'serviceWorker' in navigator ? navigator.serviceWorker : undefined,
-      cachesApi: 'caches' in window ? caches : undefined,
-    })
+    void navigator.serviceWorker
+      .register('/sw.js')
+      .then((registration) => {
+        console.log('[PWA] Service Worker registered:', registration.scope)
+      })
+      .catch((err) => {
+        console.warn('[PWA] Service Worker registration failed:', err)
+      })
 
     return () => {
       window.removeEventListener('storage', handleStorage)

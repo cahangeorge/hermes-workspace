@@ -173,6 +173,59 @@ async function fetchClaudeModels(): Promise<Array<ModelEntry>> {
     .filter((e): e is ModelEntry => e !== null)
 }
 
+/**
+ * Fetch models from Ollama Cloud API (ollama.com hosted).
+ */
+async function fetchOllamaCloudModels(): Promise<Array<ModelEntry>> {
+  try {
+    const apiKey = process.env.OLLAMA_API_KEY
+    if (!apiKey) return []
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Accept': 'application/json',
+    }
+    const response = await fetch('https://ollama.com/api/tags', { headers })
+    if (!response.ok) return []
+    const payload = asRecord(await response.json())
+    const rawModels = Array.isArray(payload.models) ? payload.models : []
+    return rawModels
+      .map((entry: Record<string, unknown>) => {
+        const id = typeof entry.name === 'string' ? entry.name : ''
+        if (!id) return null
+        return {
+          id,
+          name: id.replace(/:latest$/, ''),
+          provider: 'ollama-cloud',
+          source: 'ollama-cloud',
+          size: typeof entry.size === 'number' ? Math.round(entry.size / 1024 / 1024 / 1024) : null,
+        }
+      })
+      .filter((e): e is ModelEntry => e !== null)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Fetch models from OpenCode Go membership API.
+ */
+async function fetchOpenCodeGoModels(): Promise<Array<ModelEntry>> {
+  try {
+    const response = await fetch('https://opencode.ai/zen/go/v1/models', {
+      headers: { 'Accept': 'application/json' },
+    })
+    if (!response.ok) return []
+    const payload = asRecord(await response.json())
+    const rawModels = Array.isArray(payload.data) ? payload.data : []
+    return rawModels
+      .map(normalizeModel)
+      .filter((e): e is ModelEntry => e !== null)
+      .map((m) => ({ ...m, provider: 'opencode-go' }))
+  } catch {
+    return []
+  }
+}
+
 export const Route = createFileRoute('/api/models')({
   server: {
     handlers: {
@@ -209,6 +262,25 @@ export const Route = createFileRoute('/api/models')({
               models.push(m)
               existingIds.add(m.id)
               ensureProviderInConfig(m.provider)
+            }
+          }
+
+          // Merge OpenCode Go models from membership API
+          const opencodeModels = await fetchOpenCodeGoModels()
+          for (const m of opencodeModels) {
+            if (!existingIds.has(m.id)) {
+              models.push(m)
+              existingIds.add(m.id)
+            }
+          }
+
+          // Merge Ollama Cloud models
+          const ollamaCloudModels = await fetchOllamaCloudModels()
+          for (const m of ollamaCloudModels) {
+            if (!existingIds.has(m.id)) {
+              models.push(m)
+              existingIds.add(m.id)
+              ensureProviderInConfig('ollama-cloud')
             }
           }
 
