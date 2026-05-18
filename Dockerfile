@@ -14,9 +14,13 @@ FROM node:22-slim AS build
 RUN corepack enable && apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# Install deps (cache-friendly: copy only manifests first)
+# pnpm v11 requires explicit build script approval. The only scripts we
+# actually need at build time are esbuild (platform binary download).
+# We run them manually after install instead of using --no-ignore-scripts
+# which would also run unwanted electron downloads.
 COPY package.json pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --ignore-scripts
+RUN pnpm rebuild esbuild
 
 # Copy sources and build
 COPY . .
@@ -33,9 +37,7 @@ WORKDIR /app
 
 # Copy build artefacts + runtime deps.
 # server-entry.js is the Node HTTP server that wraps the TanStack Start fetch
-# handler exported by dist/server/server.js. Without it, `node dist/server/server.js`
-# imports the handler module, runs top-level code, and exits (code 0) because
-# nothing keeps the event loop alive — see issue #129.
+# handler exported by dist/server/server.js.
 COPY --from=build --chown=workspace:workspace /app/dist ./dist
 COPY --from=build --chown=workspace:workspace /app/node_modules ./node_modules
 COPY --from=build --chown=workspace:workspace /app/package.json ./package.json
@@ -46,7 +48,7 @@ USER workspace
 ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0 \
-    HERMES_API_URL=http://hermes-agent:8642
+    HERMES_API_URL=http://172.17.0.1:8642
 
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
