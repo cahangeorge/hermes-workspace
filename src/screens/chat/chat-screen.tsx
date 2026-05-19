@@ -22,7 +22,11 @@ import {
 } from './utils'
 import {
   advanceStickyStreamingText,
+  createResponseWaitSnapshot,
   createOptimisticMessage,
+  isTerminalActiveRunStatus,
+  shouldClearWaitingForAssistantMessage,
+  type ResponseWaitSnapshot,
 } from './chat-screen-utils'
 import {
   appendHistoryMessage,
@@ -88,7 +92,7 @@ import { SEARCH_MODAL_EVENTS } from '@/hooks/use-search-modal'
 import { SIDEBAR_TOGGLE_EVENT } from '@/hooks/use-global-shortcuts'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import { TerminalPanel } from '@/components/terminal-panel'
-import { InspectorPanel } from '@/components/inspector/inspector-panel'
+import { AgentViewPanel } from '@/components/agent-view/agent-view-panel'
 import { useTerminalPanelStore } from '@/stores/terminal-panel-store'
 import { useModelSuggestions } from '@/hooks/use-model-suggestions'
 import { ModelSuggestionToast } from '@/components/model-suggestion-toast'
@@ -101,8 +105,7 @@ import { useResearchCard } from '@/hooks/use-research-card'
 // MOBILE_TAB_BAR_OFFSET removed — tab bar always hidden in chat
 import { useTapDebug } from '@/hooks/use-tap-debug'
 import { useChatMode } from '@/hooks/use-chat-mode'
-// Activity store removed — not used in Hermes Workspace
-const _noopSetActivity = (_s: string) => {}
+import { useChatActivityStore, type AgentActivity } from '@/stores/chat-activity-store'
 
 type ChatScreenProps = {
   activeFriendlyId: string
@@ -911,10 +914,8 @@ export function ChatScreen({
         if (!data.ok) return
         // Run not yet registered (gateway lag during silent processing) → keep waiting
         if (!data.run) return
-        const status = data.run.status
         // Treat unknown / transient statuses as still-active to avoid premature teardown
-        const terminalStatuses = ['completed', 'failed', 'cancelled', 'error']
-        if (terminalStatuses.includes(status)) {
+        if (isTerminalActiveRunStatus(data.run.status)) {
           streamFinish()
           refreshHistoryRef.current()
         }
@@ -948,10 +949,18 @@ export function ChatScreen({
   })
 
   const currentModelQuery = useQuery({
-    queryKey: ['claude', 'session-status-model'],
+    queryKey: [
+      'claude',
+      'session-status-model',
+      resolvedSessionKey || activeFriendlyId || 'main',
+    ],
     queryFn: async () => {
       try {
-        const res = await fetch('/api/session-status')
+        const statusSessionKey = resolvedSessionKey || activeFriendlyId || 'main'
+        const query = statusSessionKey
+          ? `?sessionKey=${encodeURIComponent(statusSessionKey)}`
+          : ''
+        const res = await fetch(`/api/session-status${query}`)
         if (!res.ok) return ''
         const data = await res.json()
         const payload = data.payload ?? data
@@ -1036,6 +1045,9 @@ export function ChatScreen({
     startStreaming,
     cancelStreaming,
   } = useStreamingMessage({
+    pinMainSession:
+      activeFriendlyId === 'main' &&
+      (resolvedSessionKey || activeFriendlyId || 'main') === 'main',
     onSessionResolved: useCallback(
       ({
         sessionKey,
@@ -1172,6 +1184,28 @@ export function ChatScreen({
     acceptedTimeoutMs: modelsQuery.data?.streamAcceptedTimeoutMs,
     handoffTimeoutMs: modelsQuery.data?.streamHandoffTimeoutMs,
   })
+
+  // Cancel any in-flight stream when the user navigates between sessions or
+  // starts a new chat. Without this, an SSE stream from session A keeps
+  // running after the user navigates away — and any chunks it had already
+  // buffered before our abort takes effect could land in session B (the
+  // newly active session). See #297 (cross-session response contamination).
+  // Note: useStreamingMessage also has its own generation-token guard for
+  // the buffered-chunk race, but cancelling here is the cleaner contract
+  // (an in-flight response that the user navigated away from is no longer
+  // wanted in either session).
+  const navCancelKeyRef = useRef<string | null>(null)
+  useEffect(() => {
+    const navKey = `${activeCanonicalKey ?? ''}::${isNewChat ? 'new' : activeFriendlyId}`
+    if (navCancelKeyRef.current === null) {
+      navCancelKeyRef.current = navKey
+      return
+    }
+    if (navCancelKeyRef.current !== navKey) {
+      navCancelKeyRef.current = navKey
+      cancelStreaming()
+    }
+  }, [activeCanonicalKey, activeFriendlyId, isNewChat, cancelStreaming])
 
   const activeIsRealtimeStreaming = isPortableMode
     ? localIsStreaming
@@ -1377,8 +1411,7 @@ export function ChatScreen({
     localStreamingMessageId,
   ])
 
-  const messageCountAtSendRef = useRef(0)
-  const lastAssistantIdAtSendRef = useRef<string | null>(null)
+  const responseWaitSnapshotRef = useRef<ResponseWaitSnapshot | null>(null)
   const prevIsRealtimeStreamingRef = useRef(activeIsRealtimeStreaming)
   const activeRealtimeStreamingRef = useRef(activeIsRealtimeStreaming)
 
@@ -1387,22 +1420,13 @@ export function ChatScreen({
   }, [activeIsRealtimeStreaming])
 
   useEffect(() => {
-    if (waitingForResponse) {
-      messageCountAtSendRef.current = finalDisplayMessages.length
-      const lastMsg = finalDisplayMessages[finalDisplayMessages.length - 1]
-      if (lastMsg?.role === 'assistant') {
-        const raw = lastMsg as Record<string, unknown>
-        lastAssistantIdAtSendRef.current = String(
-          raw.__optimisticId ??
-            raw.id ??
-            raw.messageId ??
-            raw.__realtimeSequence ??
-            '',
-        )
-      } else {
-        lastAssistantIdAtSendRef.current = null
-      }
+    if (!waitingForResponse) {
+      responseWaitSnapshotRef.current = null
+      return
     }
+    if (responseWaitSnapshotRef.current) return
+    responseWaitSnapshotRef.current =
+      createResponseWaitSnapshot(finalDisplayMessages)
   }, [waitingForResponse, finalDisplayMessages])
 
   useEffect(() => {
@@ -1413,24 +1437,9 @@ export function ChatScreen({
       }
       return
     }
-    const last = finalDisplayMessages[finalDisplayMessages.length - 1]
-    if (!last || last.role !== 'assistant') return
-    if ((last as any).__streamingStatus === 'streaming') return
-    const countGrew =
-      finalDisplayMessages.length > messageCountAtSendRef.current
-    const raw = last as Record<string, unknown>
-    const currentId = String(
-      raw.__optimisticId ??
-        raw.id ??
-        raw.messageId ??
-        raw.__realtimeSequence ??
-        '',
-    )
-    const identityChanged =
-      currentId.length > 0 &&
-      currentId !== (lastAssistantIdAtSendRef.current ?? '')
-    const noAssistantAtSend = lastAssistantIdAtSendRef.current === null
-    if (countGrew || identityChanged || noAssistantAtSend) {
+    const snapshot = responseWaitSnapshotRef.current
+    if (!snapshot) return
+    if (shouldClearWaitingForAssistantMessage(finalDisplayMessages, snapshot)) {
       if (clearTimerRef.current) return
       clearTimerRef.current = window.setTimeout(() => {
         clearTimerRef.current = null
@@ -1476,7 +1485,9 @@ export function ChatScreen({
   }, [suggestion, resolvedSessionKey, dismiss])
 
   // Sync chat activity to global store for sidebar orchestrator avatar
-  const setLocalActivity = _noopSetActivity
+  const setLocalActivity = useChatActivityStore(
+    (s) => s.setLocalActivity,
+  ) as (next: AgentActivity) => void
   useEffect(() => {
     if (liveToolActivity.length > 0) {
       setLocalActivity('tool-use')
@@ -2209,7 +2220,11 @@ export function ChatScreen({
       if (!trimmedCommand.startsWith('/')) return false
 
       if (trimmedCommand === '/new') {
-        navigate({ to: '/chat' })
+        // Use the explicit 'new' session sentinel rather than '/chat' alone.
+        // The /chat index route redirects to the last-active session via
+        // localStorage, so navigating to '/chat' would land in the previous
+        // chat instead of opening a fresh one. See #300.
+        navigate({ to: '/chat/$sessionKey', params: { sessionKey: 'new' } })
         return true
       }
 
@@ -2563,7 +2578,7 @@ export function ChatScreen({
             ? 'flex min-h-0 w-full flex-col'
             : isMobile
               ? 'flex flex-col'
-              : 'grid grid-cols-[auto_1fr] grid-rows-[minmax(0,1fr)]',
+              : 'grid grid-cols-[auto_minmax(0,1fr)_auto] grid-rows-[minmax(0,1fr)]',
         )}
       >
         {hideUi || compact || isFocusMode ? null : isMobile ? null : (
@@ -2576,8 +2591,7 @@ export function ChatScreen({
 
         <main
           className={cn(
-            'flex h-full flex-1 min-h-0 min-w-0 flex-col overflow-hidden transition-[margin-right,margin-bottom] duration-200',
-            'mr-0',
+            'flex h-full flex-1 min-h-0 min-w-0 flex-col overflow-hidden transition-[margin-bottom] duration-200',
             (activeIsRealtimeStreaming || hasPendingGeneration()) &&
               'chat-streaming-glow',
           )}
@@ -2675,7 +2689,10 @@ export function ChatScreen({
           {hideUi ? null : (
             <ContextBar
               sessionId={
-                activeSession?.key || activeSessionKey || resolvedSessionKey
+                resolvedSessionKey ||
+                activeCanonicalKey ||
+                activeSession?.key ||
+                activeSessionKey
               }
             />
           )}
@@ -2736,7 +2753,10 @@ export function ChatScreen({
               sessionKey={
                 isNewChat
                   ? undefined
-                  : forcedSessionKey || resolvedSessionKey || activeSessionKey
+                  : forcedSessionKey ||
+                    resolvedSessionKey ||
+                    activeCanonicalKey ||
+                    activeSessionKey
               }
               wrapperRef={composerRef}
               composerRef={composerHandleRef}
@@ -2748,9 +2768,9 @@ export function ChatScreen({
             />
           ) : null}
         </main>
+        {!compact && !isFocusMode && <AgentViewPanel />}
       </div>
       {!compact && !hideUi && !isMobile && !isFocusMode && <TerminalPanel />}
-      <InspectorPanel />
 
       {suggestion && (
         <ModelSuggestionToast

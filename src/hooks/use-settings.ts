@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { getTheme, setTheme } from '@/lib/theme'
@@ -10,6 +11,7 @@ export type StudioSettings = {
   claudeToken: string
   theme: SettingsThemeMode
   accentColor: AccentColor
+  showUsageMeter: boolean
   editorFontSize: number
   editorWordWrap: boolean
   editorMinimap: boolean
@@ -34,6 +36,7 @@ export const defaultStudioSettings: StudioSettings = {
   claudeToken: '',
   theme: 'system',
   accentColor: 'blue',
+  showUsageMeter: false,
   editorFontSize: 13,
   editorWordWrap: true,
   editorMinimap: false,
@@ -72,6 +75,10 @@ export const useSettingsStore = create<SettingsState>()(
 )
 
 export function useSettings() {
+  useEffect(() => {
+    void useSettingsStore.persist.rehydrate()
+  }, [])
+
   const settings = useSettingsStore(function selectSettings(state) {
     return state.settings
   })

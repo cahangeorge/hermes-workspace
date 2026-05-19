@@ -12,6 +12,7 @@ import {
   ViewIcon,
 } from '@hugeicons/core-free-icons'
 import { cn } from '@/lib/utils'
+import { WorkflowHelpModal } from '@/components/workflow-help-modal'
 import {
   getOnlineStatus,
   useCrewStatus,
@@ -25,6 +26,8 @@ import { SwarmTerminal } from '@/components/swarm/swarm-terminal'
 import { useQuery } from '@tanstack/react-query'
 
 const SWARM_ROOM_STORAGE_KEY = 'claude-swarm-room-v1'
+const WORKER_ID_PATTERN = /^(swarm\d+|[a-z][a-z0-9]*(?:-[a-z0-9]+)*)$/i
+const isWorkerId = (id: string) => WORKER_ID_PATTERN.test(id)
 
 type WorkerHealth = { workerId: string; recentAuthErrors: number }
 type HealthData = { workspaceModel: string | null; workers: WorkerHealth[]; summary: { totalWorkers: number; totalAuthErrors24h: number; distinctProviders: string[] } }
@@ -120,7 +123,7 @@ export function SwarmScreen() {
 
   const swarmMembers = useMemo(() => {
     return [...crew]
-      .filter((member) => /^swarm\d+$/i.test(member.id))
+      .filter((member) => isWorkerId(member.id))
       .sort((a, b) => {
         const aSwarm = /^swarm\d+$/i.test(a.id)
         const bSwarm = /^swarm\d+$/i.test(b.id)
@@ -227,6 +230,34 @@ export function SwarmScreen() {
           </div>
         ) : null}
         <div className="ml-auto flex items-center gap-2">
+          <WorkflowHelpModal
+            compact
+            eyebrow="Swarm"
+            title="How Swarm works"
+            sections={[
+              {
+                title: 'What Swarm is for',
+                bullets: [
+                  'Swarm is the multi-worker orchestration surface for parallel execution.',
+                  'Use it when one goal should be split across several agents with live visibility and routing.',
+                ],
+              },
+              {
+                title: 'Typical flow',
+                bullets: [
+                  'Select workers, dispatch targeted tasks, and monitor progress from the hub and cards.',
+                  'Use ping, refresh, and card status to triage stuck or unhealthy workers quickly.',
+                ],
+              },
+              {
+                title: 'FAQ',
+                bullets: [
+                  'If workers look empty or unhealthy, fix setup and runtime issues in Operations first.',
+                  'Swarm is best for coordination and throughput, not first-time configuration.',
+                ],
+              },
+            ]}
+          />
           <ViewModeToggle mode={viewMode} setMode={setViewMode} />
           {updatedAgo ? <div className="text-[11px] text-emerald-200/55">Updated {updatedAgo}</div> : null}
           <button
@@ -237,6 +268,15 @@ export function SwarmScreen() {
           >
             <HugeiconsIcon icon={RefreshIcon} size={11} className={isFetching ? 'animate-spin' : ''} />
             Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => setMissionOpen(true)}
+            disabled={!selectedId}
+            className="inline-flex items-center gap-2 rounded-full border border-emerald-400/35 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-400/20 disabled:opacity-50"
+          >
+            <HugeiconsIcon icon={ComputerTerminal01Icon} size={12} />
+            Route to {selectedId ?? 'agent'}
           </button>
           <button
             type="button"

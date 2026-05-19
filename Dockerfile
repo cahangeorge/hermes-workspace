@@ -28,10 +28,13 @@ RUN pnpm build
 
 # ─── runtime stage ────────────────────────────────────────────────────────
 FROM node:22-slim
+# python3 is required by scripts/pty-helper.py (terminal feature). Originally
+# added in PR #185 for issue #161; regressed by the 2026-05-01 rename commit
+# efcb7d14 and re-added here per issue #259.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl tini \
+      ca-certificates curl tini python3 \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r workspace && useradd -r -g workspace -u 10010 workspace
+    && groupadd -r workspace && useradd -r -g workspace -u 10010 -m workspace
 
 WORKDIR /app
 

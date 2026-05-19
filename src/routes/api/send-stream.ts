@@ -1,13 +1,15 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { buildResolvedSessionHeaders } from '../../lib/send-stream-session-headers'
+import { buildWorkspaceScopedTextMessage } from '../../lib/workspace-message-scope'
 import {
   collectSyntheticLiveToolEvents,
   createSyntheticLiveToolTracker,
-} from './send-stream-live-tools'
+} from './-send-stream-live-tools'
 import { resolveSessionKey } from '../../server/session-utils'
 import { isAuthenticated } from '../../server/auth-middleware'
 import { requireJsonContentType } from '../../server/rate-limit'
 import { publishChatEvent } from '../../server/chat-event-bus'
+import { loadWorkspaceCatalog } from './workspace'
 import {
   registerActiveSendRun,
   unregisterActiveSendRun,
@@ -22,12 +24,9 @@ import {
 import { getChatMode } from '../../server/gateway-capabilities'
 import { ensureLocalSession, appendLocalMessage, getLocalMessages, touchLocalSession } from '../../server/local-session-store'
 import { getLocalProviderDef, getDiscoveredModels } from '../../server/local-provider-discovery'
-import {
-  
-  
-  openaiChat
-} from '../../server/openai-compat-api'
+import { openaiChat } from '../../server/openai-compat-api'
 import { streamResponses } from '../../server/responses-api'
+import { selectPortableConversationHistory } from '../../server/portable-history'
 import {
   SESSIONS_API_UNAVAILABLE_MESSAGE,
   createSession,
@@ -371,6 +370,12 @@ export const Route = createFileRoute('/api/send-stream')({
           resolvedFriendlyId = sessionKey
         }
 
+        const workspaceScope = await loadWorkspaceCatalog().catch(() => null)
+        const scopedMessage = buildWorkspaceScopedTextMessage(
+          getChatMessage(message, attachments),
+          workspaceScope,
+        )
+
         // Create streaming response using the SHARED server connection
         const encoder = new TextEncoder()
         let streamClosed = false
@@ -512,7 +517,7 @@ export const Route = createFileRoute('/api/send-stream')({
 
                 try {
                   const userContent = buildMultimodalContent(
-                    message,
+                    scopedMessage,
                     attachments,
                   )
                   // Inject locale preference so the agent responds in the user's language
@@ -520,9 +525,13 @@ export const Route = createFileRoute('/api/send-stream')({
                   const localeSystemMsg: Array<OpenAICompatMessage> = locale && locale !== 'en'
                     ? [{ role: 'system', content: `Respond in ${locale === 'es' ? 'Spanish' : locale === 'fr' ? 'French' : locale === 'zh' ? 'Chinese' : locale === 'de' ? 'German' : locale === 'ja' ? 'Japanese' : locale === 'ko' ? 'Korean' : locale === 'pt' ? 'Portuguese' : locale === 'ru' ? 'Russian' : locale === 'ar' ? 'Arabic' : 'English'}. The user's interface is set to this language.` }]
                     : []
-                  // Load persisted history for this session, then append user message
+                  // Load persisted history for this session, then append user message.
+                  // When the gateway can bind portable chat to a server-side session
+                  // via X-Claude-Session-Id, replaying the entire local transcript on
+                  // every turn duplicates prompt context and can trip model limits
+                  // on otherwise simple tasks (#405).
                   const persistedMessages = getLocalMessages(portableSessionKey)
-                  const persistedHistory = persistedMessages.map(m => ({
+                  const persistedHistory = persistedMessages.map((m) => ({
                     role: m.role as 'user' | 'assistant' | 'system',
                     content: m.content,
                   }))
@@ -533,8 +542,11 @@ export const Route = createFileRoute('/api/send-stream')({
                     content: typeof body.message === 'string' ? body.message : '',
                     timestamp: Date.now(),
                   })
-                  // Use persisted history if available, otherwise fall back to client-sent history
-                  const effectiveHistory = persistedHistory.length > 0 ? persistedHistory : history
+                  const effectiveHistory = selectPortableConversationHistory(
+                    persistedHistory,
+                    history,
+                    { localBaseUrl },
+                  )
                   const portableMessages: Array<OpenAICompatMessage> = [
                     ...localeSystemMsg,
                     ...effectiveHistory,
@@ -570,7 +582,7 @@ export const Route = createFileRoute('/api/send-stream')({
                     >()
                     try {
                       const responsesStream = streamResponses({
-                        input: typeof message === 'string' ? message : '',
+                        input: scopedMessage,
                         conversationHistory: effectiveHistory,
                         model:
                           typeof body.model === 'string' ? body.model : undefined,
@@ -958,7 +970,7 @@ export const Route = createFileRoute('/api/send-stream')({
                 await streamChat(
                 sessionKey,
                 {
-                  message: getChatMessage(message, attachments),
+                  message: scopedMessage,
                   model:
                     typeof body.model === 'string' ? body.model : undefined,
                   system_message: thinking,

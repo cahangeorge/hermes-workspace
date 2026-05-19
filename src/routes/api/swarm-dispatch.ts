@@ -5,12 +5,30 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { isAuthenticated } from '../../server/auth-middleware'
-import { newestCheckpointFromMessages, type ParsedSwarmCheckpoint } from '../../server/swarm-checkpoints'
+import { newestCheckpointFromMessages, parseSwarmCheckpoint, type ParsedSwarmCheckpoint } from '../../server/swarm-checkpoints'
 import { readWorkerMessages } from '../../server/swarm-chat-reader'
 import { createOrUpdateMission, markMissionAssignmentDispatched, recordMissionCheckpoint } from '../../server/swarm-missions'
 import { appendSwarmMemoryEvent, buildSwarmStartupSnapshot } from '../../server/swarm-memory'
 import { rosterByWorkerId, type SwarmRosterWorker } from '../../server/swarm-roster'
 import { publishSwarmCheckpointNotification } from '../../server/swarm-notifications'
+
+const HERMES_BIN_CANDIDATES = [
+  process.env.HERMES_CLI_BIN,
+  join(homedir(), '.hermes', 'hermes-agent', 'venv', 'bin', 'hermes'),
+  join(homedir(), '.local', 'bin', 'hermes'),
+  'hermes',
+].filter((value): value is string => Boolean(value))
+
+function resolveHermesBin(): string {
+  for (const candidate of HERMES_BIN_CANDIDATES) {
+    if (candidate.includes('/')) {
+      if (existsSync(candidate)) return candidate
+      continue
+    }
+    return candidate
+  }
+  return 'hermes'
+}
 
 type AssignmentRequest = {
   workerId: string
@@ -78,7 +96,9 @@ function getProfilesDir(): string {
 }
 
 function getWrapperPath(workerId: string): string {
-  return join(homedir(), '.local', 'bin', workerId)
+  const worker = rosterByWorkerId([workerId]).get(workerId)
+  const wrapperName = worker?.wrapper?.trim() || workerId
+  return join(homedir(), '.local', 'bin', wrapperName)
 }
 
 function getProfilePath(workerId: string): string {
@@ -90,19 +110,38 @@ function validateWorkerId(workerId: string): boolean {
 }
 
 const TMUX_BIN_CANDIDATES = [
-  join(homedir(), '.local', 'bin', 'tmux'),
+  process.env.TMUX_BIN,
   '/opt/homebrew/bin/tmux',
   '/usr/local/bin/tmux',
+  '/usr/bin/tmux',
+  join(homedir(), '.local', 'bin', 'tmux'),
   'tmux',
-]
+].filter((value): value is string => Boolean(value))
 
 function resolveTmuxBin(): string | null {
+  // Allow operators on non-standard installs (Docker, NixOS, custom
+  // package layouts) to point Swarm at the right tmux binary without
+  // patching this list. See #244.
+  const override = process.env.HERMES_TMUX_BIN || process.env.CLAUDE_TMUX_BIN
+  if (override) {
+    if (existsSync(override)) return override
+    // If the override looks like a bare command (no slashes), trust it
+    // and let execFile resolve it via PATH.
+    if (!override.includes('/')) return override
+  }
   for (const candidate of TMUX_BIN_CANDIDATES) {
     if (candidate.includes('/')) {
-      if (existsSync(candidate)) return candidate
-    } else {
-      return candidate
+      if (
+        candidate === process.env.TMUX_BIN ||
+        candidate === '/opt/homebrew/bin/tmux' ||
+        candidate === '/usr/local/bin/tmux' ||
+        existsSync(candidate)
+      ) {
+        return candidate
+      }
+      continue
     }
+    return candidate
   }
   return null
 }
@@ -155,6 +194,25 @@ function resolveGithubToken(): string | null {
 
 function shellEscapeSingle(value: string): string {
   return value.replace(/'/g, `'\\''`)
+}
+
+export function buildHermesTmuxLaunchCommand(input: {
+  profilePath: string
+  hermesBin: string
+  ghToken?: string | null
+}): string {
+  const launchPrefix = [
+    `HERMES_HOME='${shellEscapeSingle(input.profilePath)}'`,
+    `HERMES_CLI_BIN='${shellEscapeSingle(input.hermesBin)}'`,
+    input.ghToken ? `GH_TOKEN='${shellEscapeSingle(input.ghToken)}'` : '',
+    input.ghToken ? `GITHUB_TOKEN='${shellEscapeSingle(input.ghToken)}'` : '',
+  ].filter(Boolean).join(' ')
+  const hermesBin = shellEscapeSingle(input.hermesBin)
+
+  // Do not exec the Hermes process. Keeping the parent shell alive means a
+  // failed worker startup leaves a readable tmux pane instead of destroying the
+  // session and turning the real error into "can't find pane".
+  return `${launchPrefix} '${hermesBin}' chat --tui; status=$?; printf '\n[Hermes worker exited with status %s]\n' "$status"`
 }
 
 function parseAssignments(value: unknown): Array<AssignmentRequest> {
@@ -334,18 +392,21 @@ export function checkpointFromRuntimeSnapshot(snapshot: RuntimeCheckpointSnapsho
   return checkpoint
 }
 
-async function buildWorkerPrompt(input: {
+export function buildWorkerPrompt(input: {
   workerId: string
   task: string
   rationale?: string
   roster?: SwarmRosterWorker
   direct?: boolean
+  raw?: boolean
   missionId?: string | null
   taskTitle?: string | null
-}): Promise<string> {
-  if (input.direct) return input.task
+}): string {
+  if (input.direct && input.raw) return input.task
   const roster = input.roster
+  const displayName = roster?.name?.trim() || input.workerId
   const role = roster?.role || 'Worker'
+  const humanLabel = `${displayName} — ${role}`
   const skills = roster?.skills?.length ? roster.skills.join(', ') : 'swarm-worker-core'
   const capabilities = roster?.capabilities?.length ? roster.capabilities.join(', ') : 'not declared'
   const mission = roster?.mission || 'Execute assigned swarm tasks and checkpoint progress.'
@@ -368,7 +429,8 @@ async function buildWorkerPrompt(input: {
 
   const lines: Array<string> = [
     '## Swarm Orchestrator Dispatch',
-    `Worker: ${input.workerId} — ${role}`,
+    `Worker: ${humanLabel}`,
+    `Machine ID: ${input.workerId}`,
     `Specialty: ${specialty}`,
     `Mission: ${mission}`,
     `Skills: ${skills}`,
@@ -504,6 +566,17 @@ function resolveWorkerCwd(workerId: string): string {
   return homedir()
 }
 
+async function captureTmuxPane(tmuxBin: string, sessionName: string): Promise<string> {
+  const captured = await execFileAsync(tmuxBin, ['capture-pane', '-p', '-t', sessionName, '-S', '-200'], 8_000)
+  return captured.ok ? captured.stdout.trim() : ''
+}
+
+function redactStartupOutput(output: string): string {
+  return output
+    .replace(/(sk-[A-Za-z0-9_-]{12,})/g, '[REDACTED]')
+    .replace(/(gh[pousr]_[A-Za-z0-9_]{12,})/g, '[REDACTED]')
+}
+
 async function ensureLiveTmuxSession(workerId: string): Promise<{ ok: true; tmuxBin: string; sessionName: string } | { ok: false; error: string }> {
   const tmuxBin = resolveTmuxBin()
   if (!tmuxBin) return { ok: false, error: 'tmux not installed' }
@@ -515,12 +588,13 @@ async function ensureLiveTmuxSession(workerId: string): Promise<{ ok: true; tmux
 
   const profilePath = getProfilePath(workerId)
   const cwd = resolveWorkerCwd(workerId)
-  const ghToken = resolveGithubToken()
-  const launchPrefix = [
-    `HERMES_HOME='${shellEscapeSingle(profilePath)}'`,
-    ghToken ? `GH_TOKEN='${shellEscapeSingle(ghToken)}'` : '',
-    ghToken ? `GITHUB_TOKEN='${shellEscapeSingle(ghToken)}'` : '',
-  ].filter(Boolean).join(' ')
+  const hermesBin = resolveHermesBin()
+  const launchCommand = buildHermesTmuxLaunchCommand({
+    profilePath,
+    hermesBin,
+    ghToken: resolveGithubToken(),
+  })
+
   const started = await execFileAsync(tmuxBin, [
     'new-session',
     '-d',
@@ -528,14 +602,38 @@ async function ensureLiveTmuxSession(workerId: string): Promise<{ ok: true; tmux
     sessionName,
     '-c',
     cwd,
-    `${launchPrefix} exec hermes chat --continue`,
   ])
   if (!started.ok) {
     return { ok: false, error: started.error }
   }
 
-  // Give the agent a moment to render its prompt before sending keys.
+  const launched = await execFileAsync(tmuxBin, ['send-keys', '-t', sessionName, launchCommand, 'C-m'])
+  if (!launched.ok) {
+    return { ok: false, error: launched.error }
+  }
+
+  // Give the agent a moment to render its prompt before sending keys. If Hermes
+  // exits immediately, the shell stays alive and prints a sentinel that lets us
+  // surface the real startup failure instead of a later tmux "can't find pane".
   await sleep(1200)
+  if (!(await tmuxHasSession(tmuxBin, sessionName))) {
+    return { ok: false, error: `Hermes worker tmux session ${sessionName} exited during startup` }
+  }
+
+  const startupOutput = await captureTmuxPane(tmuxBin, sessionName)
+  if (startupOutput.includes('[Hermes worker exited with status')) {
+    const sanitizedOutput = redactStartupOutput(startupOutput).slice(-4_000)
+    const logsDir = join(profilePath, 'logs')
+    mkdirSync(logsDir, { recursive: true })
+    const startupLogPath = join(logsDir, 'swarm-dispatch-startup.log')
+    writeFileSync(startupLogPath, `${new Date().toISOString()} ${sanitizedOutput}
+`, { flag: 'a' })
+    return {
+      ok: false,
+      error: `Hermes worker failed to start in tmux session ${sessionName}. Startup output saved to ${startupLogPath}: ${sanitizedOutput}`,
+    }
+  }
+
   return { ok: true, tmuxBin, sessionName }
 }
 
@@ -605,16 +703,31 @@ async function sendPromptToLiveSession(workerId: string, prompt: string): Promis
     }
   }
 
-  // Give the TUI a beat to ingest the paste before submitting. Some workers
-  // render slower and otherwise keep the pasted text sitting at the prompt.
-  await sleep(120)
-  const enter = await execFileAsync(tmuxBin, ['send-keys', '-t', sessionName, 'Enter'])
+  // Give the TUI enough time to ingest the paste before submitting. The Hermes
+  // prompt can visually contain the pasted text before prompt_toolkit is ready
+  // to accept Enter; sending a confirmation Enter shortly after the first one
+  // prevents the user-visible failure mode where the task sits at the prompt.
+  await sleep(2000)
+  const enter = await execFileAsync(tmuxBin, ['send-keys', '-t', sessionName, 'C-m'])
   if (!enter.ok) {
     return {
       workerId,
       ok: false,
       output: '',
       error: enter.error,
+      durationMs: Date.now() - startedAt,
+      exitCode: null,
+      delivery: 'tmux',
+    }
+  }
+  await sleep(1000)
+  const confirmEnter = await execFileAsync(tmuxBin, ['send-keys', '-t', sessionName, 'C-m'])
+  if (!confirmEnter.ok) {
+    return {
+      workerId,
+      ok: false,
+      output: '',
+      error: confirmEnter.error,
       durationMs: Date.now() - startedAt,
       exitCode: null,
       delivery: 'tmux',
@@ -761,7 +874,7 @@ async function runWorker(assignment: AssignmentRequest, timeoutMs: number, roste
     }
 
     const useWrapper = existsSync(wrapperPath)
-    const cmd = useWrapper ? wrapperPath : 'hermes'
+    const cmd = useWrapper ? wrapperPath : resolveHermesBin()
     const args = ['chat', '-q', prompt, '-Q', '--yolo', '--ignore-rules', '--source', 'swarm-dispatch']
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -814,6 +927,48 @@ async function runWorker(assignment: AssignmentRequest, timeoutMs: number, roste
           exitCode: 0,
           delivery: 'oneshot',
         }
+        if (options?.waitForCheckpoint) {
+          const checkpoint = parseSwarmCheckpoint(out)
+          if (checkpoint) {
+            markCheckpointResult(workerId, checkpoint, options?.notifySessionKey ?? 'main')
+            recordMissionCheckpoint({
+              missionId: options?.missionId,
+              assignmentId: assignment.assignmentId ?? null,
+              workerId,
+              checkpoint,
+              source: 'swarm-dispatch',
+            })
+            appendSwarmMemoryEvent({
+              workerId,
+              missionId: options?.missionId ?? null,
+              assignmentId: assignment.assignmentId ?? null,
+              type: 'checkpoint',
+              summary: checkpoint.result ?? `Checkpoint ${checkpoint.stateLabel}`,
+              checkpoint,
+              event: {
+                stateLabel: checkpoint.stateLabel,
+                filesChanged: checkpoint.filesChanged,
+                commandsRun: checkpoint.commandsRun,
+                blocker: checkpoint.blocker,
+                nextAction: checkpoint.nextAction,
+              },
+            })
+            publishSwarmCheckpointNotification({
+              workerId,
+              missionId: options?.missionId ?? null,
+              assignmentId: assignment.assignmentId ?? null,
+              checkpoint,
+              notifySessionKey: options?.notifySessionKey ?? 'main',
+            })
+            result.checkpoint = checkpoint
+            result.checkpointStatus = 'checkpointed'
+          } else {
+            result.checkpoint = null
+            result.checkpointStatus = 'timeout'
+          }
+        } else {
+          result.checkpointStatus = 'not-requested'
+        }
         markDispatchResult(workerId, result)
         resolve(result)
       },
@@ -835,6 +990,110 @@ async function runWorker(assignment: AssignmentRequest, timeoutMs: number, roste
   })
 }
 
+export class SwarmDispatchError extends Error {
+  status: number
+
+  constructor(message: string, status = 400) {
+    super(message)
+    this.name = 'SwarmDispatchError'
+    this.status = status
+  }
+}
+
+export async function dispatchSwarmAssignments(body: DispatchRequest) {
+  let assignments = parseAssignments(body.assignments)
+  const promptRaw = typeof body.prompt === 'string' ? body.prompt : ''
+  const prompt = promptRaw.trim()
+  if (assignments.length === 0) {
+    const workerIdsRaw = Array.isArray(body.workerIds) ? body.workerIds : []
+    const workerIds = workerIdsRaw
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && validateWorkerId(value))
+    assignments = workerIds.map((workerId) => ({
+      workerId,
+      task: prompt,
+      rationale: 'Legacy broadcast dispatch.',
+      direct: body.direct === true,
+    }))
+  }
+
+  if (assignments.length === 0) {
+    throw new SwarmDispatchError('assignments[] or workerIds[] required')
+  }
+  if (assignments.length > 12) {
+    throw new SwarmDispatchError('Maximum 12 workers per dispatch')
+  }
+  if (assignments.some((assignment) => assignment.task.length === 0)) {
+    throw new SwarmDispatchError('assignment task required')
+  }
+  if (assignments.some((assignment) => assignment.task.length > MAX_PROMPT_CHARS)) {
+    throw new SwarmDispatchError(`assignment task exceeds ${MAX_PROMPT_CHARS} characters`)
+  }
+
+  const timeoutRaw = typeof body.timeoutSeconds === 'number' ? body.timeoutSeconds : DEFAULT_TIMEOUT_S
+  const timeoutSeconds = Math.max(10, Math.min(MAX_TIMEOUT_S, Math.floor(timeoutRaw)))
+  const timeoutMs = timeoutSeconds * 1000
+  const waitForCheckpoint = !(body.waitForCheckpoint === false && body.allowAsync === true)
+  const pollRaw = typeof body.checkpointPollSeconds === 'number' ? body.checkpointPollSeconds : 90
+  const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
+  const notifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim() ? body.notifySessionKey.trim() : 'main'
+
+  const requestedMissionId = typeof body.missionId === 'string' ? body.missionId.trim() : ''
+  const hasExplicitMissionTitle = typeof body.missionTitle === 'string' && body.missionTitle.trim()
+  const missionTitle = hasExplicitMissionTitle
+    ? (body.missionTitle as string).trim()
+    : requestedMissionId ? '' : assignments.length === 1 ? assignments[0].task.slice(0, 120) : `${assignments.length} assigned tasks`
+  const mission = createOrUpdateMission({
+    missionId: requestedMissionId || null,
+    title: missionTitle,
+    assignments,
+  })
+  if (mission._created) {
+    for (const workerId of new Set(assignments.map((a) => a.workerId))) {
+      try {
+        appendSwarmMemoryEvent({
+          workerId,
+          missionId: mission.id,
+          type: 'mission-start',
+          title: mission.title,
+          summary: `Mission started: ${mission.title}`,
+          event: { workers: [...new Set(assignments.map((a) => a.workerId))] },
+        })
+      } catch {}
+    }
+  }
+
+  const assignmentIdByKey = new Map(mission.assignments.map((item) => [`${item.workerId}\n${item.task}`, item.id]))
+  assignments = assignments.map((assignment) => ({
+    ...assignment,
+    assignmentId: assignmentIdByKey.get(`${assignment.workerId}\n${assignment.task}`),
+  }))
+
+  const dispatchedAt = Date.now()
+  const roster = rosterByWorkerId(assignments.map((assignment) => assignment.workerId))
+  const results = await Promise.all(assignments.map((assignment) => runWorker(
+    assignment,
+    timeoutMs,
+    roster.get(assignment.workerId),
+    { waitForCheckpoint, checkpointPollMs: checkpointPollSeconds * 1000, missionId: mission.id, notifySessionKey },
+  )))
+
+  return {
+    dispatchedAt,
+    completedAt: Date.now(),
+    missionId: mission.id,
+    mission,
+    prompt: assignments.length === 1 ? assignments[0].task : `${assignments.length} assigned tasks`,
+    assignments,
+    timeoutSeconds,
+    waitForCheckpoint,
+    checkpointPollSeconds,
+    notifySessionKey,
+    results,
+  }
+}
+
 export const Route = createFileRoute('/api/swarm-dispatch')({
   server: {
     handlers: {
@@ -850,97 +1109,14 @@ export const Route = createFileRoute('/api/swarm-dispatch')({
           return json({ error: 'Invalid JSON body' }, { status: 400 })
         }
 
-        let assignments = parseAssignments(body.assignments)
-        const promptRaw = typeof body.prompt === 'string' ? body.prompt : ''
-        const prompt = promptRaw.trim()
-        if (assignments.length === 0) {
-          const workerIdsRaw = Array.isArray(body.workerIds) ? body.workerIds : []
-          const workerIds = workerIdsRaw
-            .filter((value): value is string => typeof value === 'string')
-            .map((value) => value.trim())
-            .filter((value) => value.length > 0 && validateWorkerId(value))
-          assignments = workerIds.map((workerId) => ({ workerId, task: prompt, rationale: 'Legacy broadcast dispatch.', direct: body.direct === true }))
-        }
-
-        if (assignments.length === 0) {
-          return json({ error: 'assignments[] or workerIds[] required' }, { status: 400 })
-        }
-        if (assignments.length > 12) {
-          return json({ error: 'Maximum 12 workers per dispatch' }, { status: 400 })
-        }
-        if (assignments.some((assignment) => assignment.task.length === 0)) {
-          return json({ error: 'assignment task required' }, { status: 400 })
-        }
-        if (assignments.some((assignment) => assignment.task.length > MAX_PROMPT_CHARS)) {
-          return json({ error: `assignment task exceeds ${MAX_PROMPT_CHARS} characters` }, { status: 400 })
-        }
-
-        const timeoutRaw = typeof body.timeoutSeconds === 'number' ? body.timeoutSeconds : DEFAULT_TIMEOUT_S
-        const timeoutSeconds = Math.max(10, Math.min(MAX_TIMEOUT_S, Math.floor(timeoutRaw)))
-        const timeoutMs = timeoutSeconds * 1000
-        // Swarm2 control-plane dispatches should be observable by default:
-        // wait for a fresh checkpoint so completion/blocker notifications can
-        // be published and worker progress cards can resolve. Callers that
-        // intentionally want fire-and-forget delivery must opt out with both
-        // waitForCheckpoint:false and allowAsync:true.
-        const waitForCheckpoint = !(body.waitForCheckpoint === false && body.allowAsync === true)
-        const pollRaw = typeof body.checkpointPollSeconds === 'number' ? body.checkpointPollSeconds : 90
-        const checkpointPollSeconds = Math.max(5, Math.min(300, Math.floor(pollRaw)))
-        const notifySessionKey = typeof body.notifySessionKey === 'string' && body.notifySessionKey.trim() ? body.notifySessionKey.trim() : 'main'
-
-        const requestedMissionId = typeof body.missionId === 'string' ? body.missionId.trim() : ''
-        const hasExplicitMissionTitle = typeof body.missionTitle === 'string' && body.missionTitle.trim()
-        const missionTitle = hasExplicitMissionTitle
-          ? (body.missionTitle as string).trim()
-          : requestedMissionId ? '' : assignments.length === 1 ? assignments[0].task.slice(0, 120) : `${assignments.length} assigned tasks` 
-        const mission = createOrUpdateMission({
-          missionId: requestedMissionId || null,
-          title: missionTitle,
-          assignments,
-        })
-        if (mission._created) {
-          for (const workerId of new Set(assignments.map((a) => a.workerId))) {
-            try {
-              appendSwarmMemoryEvent({
-                workerId,
-                missionId: mission.id,
-                type: 'mission-start',
-                title: mission.title,
-                summary: `Mission started: ${mission.title}`,
-                event: { workers: [...new Set(assignments.map((a) => a.workerId))] },
-              })
-            } catch { /* memory write best-effort */ }
+        try {
+          return json(await dispatchSwarmAssignments(body))
+        } catch (error) {
+          if (error instanceof SwarmDispatchError) {
+            return json({ error: error.message }, { status: error.status })
           }
+          return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 })
         }
-
-        const assignmentIdByKey = new Map(mission.assignments.map((item) => [`${item.workerId}\n${item.task}`, item.id]))
-        assignments = assignments.map((assignment) => ({
-          ...assignment,
-          assignmentId: assignmentIdByKey.get(`${assignment.workerId}\n${assignment.task}`),
-        }))
-
-        const dispatchedAt = Date.now()
-        const roster = rosterByWorkerId(assignments.map((assignment) => assignment.workerId))
-        const results = await Promise.all(assignments.map((assignment) => runWorker(
-          assignment,
-          timeoutMs,
-          roster.get(assignment.workerId),
-          { waitForCheckpoint, checkpointPollMs: checkpointPollSeconds * 1000, missionId: mission.id, notifySessionKey },
-        )))
-
-        return json({
-          dispatchedAt,
-          completedAt: Date.now(),
-          missionId: mission.id,
-          mission,
-          prompt: assignments.length === 1 ? assignments[0].task : `${assignments.length} assigned tasks`,
-          assignments,
-          timeoutSeconds,
-          waitForCheckpoint,
-          checkpointPollSeconds,
-          notifySessionKey,
-          results,
-        })
       },
     },
   },

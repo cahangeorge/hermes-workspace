@@ -4,6 +4,35 @@ import { readResolvedSessionHeaders } from '@/lib/send-stream-session-headers'
 import { useChatStore } from '@/stores/chat-store'
 import { pushActivity } from '@/components/inspector/activity-store'
 
+/**
+ * Determine whether a stream-resolved session key change should trigger
+ * onSessionResolved (which navigates the route). Only bootstrap keys
+ * ("new", "main") should promote a backend-returned session ID to the
+ * Workspace route identity. Concrete sessions must never be overridden
+ * by a backend-derived api-* ID — that causes session splits (#297).
+ */
+export function shouldResolveStreamSession({
+  requestedSessionKey,
+  currentSessionKey,
+  resolvedSessionKey,
+  pinMainSession = false,
+}: {
+  requestedSessionKey: string
+  currentSessionKey: string
+  resolvedSessionKey: string
+  pinMainSession?: boolean
+}): boolean {
+  // No change → nothing to resolve
+  if (resolvedSessionKey === currentSessionKey) return false
+  // "new" should resolve once to a concrete session.
+  if (requestedSessionKey === 'new') return true
+  // "main" only stays pinned when the current route is intentionally bound to
+  // the portable Workspace session in zero-fork mode.
+  if (requestedSessionKey === 'main') return !pinMainSession
+  // Concrete session → never promote a different backend ID
+  return false
+}
+
 type StreamingState = {
   isStreaming: boolean
   streamingMessageId: string | null
@@ -42,6 +71,7 @@ type PortableHistoryMessage = {
 }
 
 type UseStreamingMessageOptions = {
+  pinMainSession?: boolean
   onStarted?: (payload: { runId: string | null }) => void
   onChunk?: (text: string, fullText: string) => void
   onComplete?: (message: ChatMessage) => void
@@ -64,6 +94,7 @@ type UseStreamingMessageOptions = {
 
 export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
   const {
+    pinMainSession = false,
     onStarted,
     onChunk,
     onComplete,
@@ -96,11 +127,24 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
     typeof setTimeout
   > | null>(null)
   const activeSessionKeyRef = useRef<string>('main')
+  // Monotonically increasing token. Each call to startStreaming bumps this so
+  // any in-flight processStream loop (or pending microtask processing chunks
+  // it has already read into the SSE buffer) can detect that it's stale and
+  // refuse to dispatch its events. Without this, chunks from an aborted stream
+  // can still write into the new session's chat history during the brief
+  // window between abort() and the underlying fetch reader actually stopping.
+  // See #297 (cross-session response contamination).
+  const streamGenerationRef = useRef<number>(0)
   const lifecyclePhaseRef = useRef<StreamLifecyclePhase>('idle')
   const acceptedAtRef = useRef<number | null>(null)
   const lastActivityAtRef = useRef<number | null>(null)
   const handoffTimerRef = useRef<number | null>(null)
   const stepUsageRef = useRef<StepUsagePayload>({})
+  // Captures the sessionKey the caller requested at stream-start time so
+  // SSE `started` events can decide whether a backend-returned session ID
+  // should be promoted to the route identity. Prevents concrete sessions
+  // from being overridden by api-* derivations (#297).
+  const requestedSessionKeyRef = useRef<string>('')
 
   const registerSendStreamRun = useChatStore((s) => s.registerSendStreamRun)
   const unregisterSendStreamRun = useChatStore((s) => s.unregisterSendStreamRun)
@@ -428,11 +472,21 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
               ? payload.friendlyId.trim()
               : resolvedSessionKey
           if (resolvedSessionKey !== activeSessionKeyRef.current) {
-            activeSessionKeyRef.current = resolvedSessionKey
-            onSessionResolved?.({
-              sessionKey: resolvedSessionKey,
-              friendlyId: resolvedFriendlyId,
-            })
+            // Guard: only promote backend session IDs for bootstrap keys.
+            // Concrete Workspace sessions must never be overridden (#297).
+            if (
+              shouldResolveStreamSession({
+                requestedSessionKey: requestedSessionKeyRef.current,
+                currentSessionKey: activeSessionKeyRef.current,
+                resolvedSessionKey,
+              })
+            ) {
+              activeSessionKeyRef.current = resolvedSessionKey
+              onSessionResolved?.({
+                sessionKey: resolvedSessionKey,
+                friendlyId: resolvedFriendlyId,
+              })
+            }
           }
           // Register runId so chat-events skips duplicate chunks for this run
           const runId = payload.runId as string | undefined
@@ -594,6 +648,18 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
             phase: 'complete',
             name: `artifact:${kind}`,
             result: path ? `${title} — ${path}` : title,
+            preview:
+              typeof payload.preview === 'string' && payload.preview.trim()
+                ? payload.preview.trim()
+                : undefined,
+            // Preserve the structured artifact metadata so the chat renderer
+            // can show a first-class artifact card instead of degrading the
+            // event to a generic tool row. See #295.
+            args: {
+              title,
+              kind,
+              path: path || undefined,
+            },
             runId: activeRunIdRef.current ?? undefined,
             sessionKey: activeSessionKeyRef.current,
             transport: 'send-stream',
@@ -767,6 +833,15 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
       finishedRef.current = false
       resetActiveStreamState(params.sessionKey)
       lifecyclePhaseRef.current = 'requesting'
+      requestedSessionKeyRef.current = params.sessionKey
+
+      // Bump the generation token so any chunks the previous stream had
+      // already buffered but not yet dispatched (after our abort() call)
+      // get rejected when they reach processEvent. The local capture is
+      // what this run will compare against. See #297.
+      streamGenerationRef.current += 1
+      const myGeneration = streamGenerationRef.current
+      const mySessionKey = params.sessionKey
 
       const messageId = `streaming-${Date.now()}`
 
@@ -811,11 +886,23 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
         const resolvedSessionKey = resolvedHeaders.sessionKey
         const resolvedFriendlyId = resolvedHeaders.friendlyId
         if (resolvedSessionKey !== activeSessionKeyRef.current) {
-          activeSessionKeyRef.current = resolvedSessionKey
-          onSessionResolved?.({
-            sessionKey: resolvedSessionKey,
-            friendlyId: resolvedFriendlyId,
-          })
+          // Only promote a backend-returned session ID when the original
+          // request was a bootstrap key ("new"/"main"). Concrete Workspace
+          // sessions must never be overridden — that causes splits (#297).
+          if (
+            shouldResolveStreamSession({
+              requestedSessionKey: params.sessionKey,
+              currentSessionKey: activeSessionKeyRef.current,
+              resolvedSessionKey,
+              pinMainSession,
+            })
+          ) {
+            activeSessionKeyRef.current = resolvedSessionKey
+            onSessionResolved?.({
+              sessionKey: resolvedSessionKey,
+              friendlyId: resolvedFriendlyId,
+            })
+          }
         }
 
         markAccepted()
@@ -845,12 +932,31 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
           const { done, value } = await reader.read()
           if (done) break
 
+          // Guard against stale streams writing into a newer session.
+          // If startStreaming was called again with a different sessionKey,
+          // streamGenerationRef has been bumped; this loop's reads are now
+          // for an aborted/superseded stream and must not dispatch events.
+          // See #297.
+          if (streamGenerationRef.current !== myGeneration) {
+            try {
+              await reader.cancel()
+            } catch {
+              // Reader may already be closed; safe to ignore.
+            }
+            break
+          }
+
           buffer += decoder.decode(value, { stream: true })
           const events = buffer.split('\n\n')
           buffer = events.pop() ?? ''
 
           for (const eventBlock of events) {
             if (!eventBlock.trim()) continue
+
+            // Re-check between events as well — a single read() can yield a
+            // batch of buffered events; if a new stream started mid-batch,
+            // the rest of this batch must be dropped.
+            if (streamGenerationRef.current !== myGeneration) break
 
             const lines = eventBlock.split('\n')
             let currentEvent = ''
@@ -888,6 +994,11 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
             ...prev,
             isStreaming: false,
           }))
+          const abortedPhase = lifecyclePhaseRef.current as StreamLifecyclePhase
+          if (abortedPhase === 'handoff') {
+            schedulePostAcceptanceTimeout('handoff')
+            return
+          }
           onAbort?.()
           return
         }
@@ -902,6 +1013,7 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
       onAbort,
       onMessageAccepted,
       onSessionResolved,
+      pinMainSession,
       processEvent,
       resetActiveStreamState,
       schedulePostAcceptanceTimeout,
@@ -909,13 +1021,22 @@ export function useStreamingMessage(options: UseStreamingMessageOptions = {}) {
   )
 
   const cancelStreaming = useCallback(() => {
+    if (
+      lifecyclePhaseRef.current === 'accepted' ||
+      lifecyclePhaseRef.current === 'active' ||
+      lifecyclePhaseRef.current === 'handoff'
+    ) {
+      transitionToHandoff()
+    }
     if (eventSourceRef.current) {
       eventSourceRef.current.abort()
       eventSourceRef.current = null
     }
-    finishedRef.current = true
-    resetActiveStreamState()
-  }, [resetActiveStreamState])
+    finishedRef.current = lifecyclePhaseRef.current !== 'handoff'
+    if (lifecyclePhaseRef.current !== 'handoff') {
+      resetActiveStreamState()
+    }
+  }, [resetActiveStreamState, transitionToHandoff])
 
   const resetStreaming = useCallback(() => {
     cancelStreaming()

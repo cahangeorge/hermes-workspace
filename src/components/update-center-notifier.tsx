@@ -28,6 +28,7 @@ type ProductUpdateStatus = {
   canUpdate: boolean
   state: 'current' | 'available' | 'blocked' | 'unsupported' | 'error'
   reason: string | null
+  blockingFiles?: Array<string>
   updateMode: string
 }
 
@@ -74,7 +75,7 @@ function shortSha(value: string | null | undefined): string {
 }
 
 function productDismissKey(product: ProductUpdateStatus): string {
-  return `${product.id}:${product.latestHead ?? product.version ?? 'unknown'}`
+  return `${product.id}:${product.latestHead ?? product.version}`
 }
 
 function notesId(sections: Array<ReleaseNoteSection>): string {
@@ -86,23 +87,28 @@ function notesId(sections: Array<ReleaseNoteSection>): string {
 
 function storeNotes(sections: Array<ReleaseNoteSection>): Notes | null {
   if (!sections.length) return null
-  const notes = { id: notesId(sections), sections, updatedAt: Date.now() }
-  localStorage.setItem(NOTES_KEY, JSON.stringify(notes))
-  localStorage.removeItem(NOTES_SEEN_KEY)
-  return notes
-}
-
-function readNotes(): Notes | null {
+  const id = notesId(sections)
+  const notes = { id, sections, updatedAt: Date.now() }
+  // Only clear the "seen" marker when the release-notes payload actually
+  // changed. Without this guard the modal pops up on every page refresh
+  // because /api/update/status returns the same pendingReleaseNotes on every
+  // poll, useEffect fires, and we used to drop the seen marker every time.
+  // See #356.
+  let existingId: string | null = null
   try {
     const raw = localStorage.getItem(NOTES_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as Notes
-    if (!parsed?.id || !Array.isArray(parsed.sections)) return null
-    if (localStorage.getItem(NOTES_SEEN_KEY) === parsed.id) return null
-    return parsed
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Notes>
+      existingId = typeof parsed.id === 'string' ? parsed.id : null
+    }
   } catch {
-    return null
+    existingId = null
   }
+  if (existingId !== id) {
+    localStorage.removeItem(NOTES_SEEN_KEY)
+  }
+  localStorage.setItem(NOTES_KEY, JSON.stringify(notes))
+  return notes
 }
 
 export function UpdateCenterNotifier() {
@@ -125,7 +131,9 @@ export function UpdateCenterNotifier() {
         values.add(localStorage.getItem(key) || '')
     }
     setDismissed(values)
-    setNotes(readNotes())
+    // Do not open historical release notes on startup. Successful in-app
+    // updates still call setNotes immediately after apply, but a routine
+    // status poll should not interrupt users with stale "what changed" copy.
   }, [])
 
   const { data } = useQuery({
@@ -149,7 +157,13 @@ export function UpdateCenterNotifier() {
   const visibleProducts = useMemo(() => {
     const products = data ? [data.products.workspace, data.products.agent] : []
     return products.filter((product) => {
+      // Product decision: only show the top-of-app update banner when a
+      // one-click update is actually safe. Dirty checkouts, non-main branches,
+      // and blocked/conflicting states still exist, but they belong in an
+      // advanced update center view rather than a disruptive banner. See
+      // Eric feedback 2026-05-04.
       if (!product.updateAvailable) return false
+      if (!product.canUpdate) return false
       if (phases[product.id] === 'done') return false
       return !dismissed.has(productDismissKey(product))
     })
@@ -257,7 +271,13 @@ function UpdateCard({
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: -24, scale: 0.96 }}
       transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}
-      className="pointer-events-auto overflow-hidden rounded-2xl shadow-2xl"
+      // Firefox/Linux right-clicks on this card were intermittently eaten by
+      // the surrounding motion/backdrop layers, making the modal feel
+      // unresponsive and preventing copy/open-in-new-tab actions. Let the
+      // native context menu open on the card itself and keep the event from
+      // bubbling to the backdrop. See #286.
+      onContextMenu={(event) => event.stopPropagation()}
+      className="pointer-events-auto overflow-hidden rounded-2xl shadow-2xl select-text"
       style={{
         background: 'var(--theme-card)',
         border: '1px solid var(--theme-border)',
@@ -314,12 +334,45 @@ function UpdateCard({
               ? `${product.label} update blocked`
               : `${product.label} update available`}
           </p>
+          {/* Don't truncate when blocked — the full reason is what the
+              user needs to act on. See #293. */}
           <p
-            className="truncate text-xs"
+            className={cn('text-xs', blocked ? '' : 'truncate')}
             style={{ color: 'var(--theme-muted)' }}
           >
             {subtitle}
           </p>
+          {blocked && product.repoPath ? (
+            <p
+              className="mt-0.5 truncate font-mono text-[11px]"
+              style={{ color: 'var(--theme-muted)' }}
+              title={product.repoPath}
+            >
+              {product.repoPath}
+            </p>
+          ) : null}
+          {blocked && product.blockingFiles && product.blockingFiles.length > 0 ? (
+            <ul className="mt-1 max-h-24 overflow-auto pr-1">
+              {product.blockingFiles.slice(0, 8).map((file) => (
+                <li
+                  key={file}
+                  className="truncate font-mono text-[11px]"
+                  style={{ color: 'var(--theme-muted)' }}
+                  title={file}
+                >
+                  {file}
+                </li>
+              ))}
+              {product.blockingFiles.length > 8 ? (
+                <li
+                  className="text-[11px] italic"
+                  style={{ color: 'var(--theme-muted)' }}
+                >
+                  …and {product.blockingFiles.length - 8} more
+                </li>
+              ) : null}
+            </ul>
+          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {product.canUpdate ? (
@@ -375,10 +428,11 @@ function ReleaseNotes({
         exit={{ opacity: 0 }}
       >
         <motion.div
-          className="w-full max-w-lg overflow-hidden rounded-2xl shadow-2xl"
+          className="w-full max-w-lg overflow-hidden rounded-2xl shadow-2xl select-text"
           initial={{ opacity: 0, y: 24, scale: 0.96 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: 24, scale: 0.96 }}
+          onContextMenu={(event) => event.stopPropagation()}
           style={{
             background: 'var(--theme-card)',
             border: '1px solid var(--theme-border)',

@@ -4,12 +4,15 @@ import {
   ArrowLeft01Icon,
   ArrowRight01Icon,
   BrainIcon,
+  Building01Icon,
+  Castle02Icon,
   Chat01Icon,
   CheckListIcon,
   Clock01Icon,
   ComputerTerminal01Icon,
   DashboardSquare01Icon,
   File01Icon,
+  McpServerIcon,
   MessageMultiple01Icon,
   Moon02Icon,
   PencilEdit02Icon,
@@ -217,7 +220,19 @@ function NavItem({
             {item.label}
           </span>
           {item.badge && item.badge !== 'error-dot' ? (
-            <span className="ml-auto inline-flex min-w-6 items-center justify-center rounded-full border border-primary-700 bg-primary-900 px-2 py-0.5 text-[10px] font-semibold leading-none text-primary-300">
+            <span
+              className="ml-auto inline-flex min-w-6 items-center justify-center rounded-full px-2 py-0.5 text-[10px] font-bold leading-none"
+              style={
+                item.badge === 'NEW'
+                  ? {
+                      background: 'linear-gradient(180deg, #fde68a 0%, #fbbf24 50%, #d4a017 100%)',
+                      color: '#0b1320',
+                      boxShadow: '0 0 8px rgba(250,204,21,0.4)',
+                      letterSpacing: '0.08em',
+                    }
+                  : undefined
+              }
+            >
               {item.badge}
             </span>
           ) : null}
@@ -561,7 +576,10 @@ function ChatSidebarComponent({
     pathname === '/new' || pathname.startsWith('/chat/new')
   const _isSettingsActive = pathname === '/settings'
   const isSkillsActive = pathname === '/skills'
+  const isMcpActive = pathname === '/mcp'
   const isFilesActive = pathname === '/files'
+  const isPlaygroundActive = pathname === '/playground'
+  const isAgoraActive = pathname === '/agora'
   const isTerminalActive = pathname === '/terminal'
   const isJobsActive = pathname === '/jobs'
   const isMemoryActive = pathname === '/memory'
@@ -777,6 +795,7 @@ function ChatSidebarComponent({
       label: t('nav.chat'),
       active: isChatActive,
     },
+
     {
       kind: 'link',
       to: '/files',
@@ -802,7 +821,7 @@ function ChatSidebarComponent({
       kind: 'link',
       to: '/tasks',
       icon: CheckListIcon,
-      label: t('nav.tasks'),
+      label: 'Tasks',
       active: isTasksActive,
     },
     {
@@ -844,6 +863,13 @@ function ChatSidebarComponent({
       label: t('nav.skills'),
       active: isSkillsActive,
       dataTour: 'skills',
+    },
+    {
+      kind: 'link',
+      to: '/mcp',
+      icon: McpServerIcon,
+      label: 'MCP',
+      active: isMcpActive,
     },
     {
       kind: 'link',
@@ -1002,6 +1028,46 @@ function ChatSidebarComponent({
               className="size-5 shrink-0"
             />
             <span>New Session</span>
+          </Link>
+        </div>
+      )}
+
+      {/* ── HermesWorld featured link (gold castle, NEW badge) ────── */}
+      {/* Hide when VITE_HERMESWORLD_ENABLED is explicitly '0' */}
+      {!isVisuallyCollapsed &&
+        (import.meta as any).env?.VITE_HERMESWORLD_ENABLED !== '0' && (
+        <div className="px-2 pb-2">
+          <Link
+            to="/playground"
+            onClick={() => onSelectSession?.()}
+            className={cn(
+              buttonVariants({ variant: 'ghost', size: 'sm' }),
+              'group w-full justify-start gap-2.5 px-3 py-2 text-primary-900 hover:bg-primary-200 dark:hover:bg-primary-800',
+              isPlaygroundActive &&
+                'bg-accent-500/10 text-accent-500 hover:bg-accent-50 dark:hover:bg-accent-900/300/15',
+            )}
+            data-tour="hermesworld"
+          >
+            <HugeiconsIcon
+              icon={Castle02Icon}
+              size={20}
+              strokeWidth={1.5}
+              className="size-5 shrink-0"
+              style={{ color: '#facc15' }}
+            />
+            <span>HermesWorld</span>
+            <span
+              className="ml-auto inline-flex min-w-6 items-center justify-center rounded-full px-2 py-0.5 text-[10px] font-bold leading-none"
+              style={{
+                background:
+                  'linear-gradient(180deg, #fde68a 0%, #fbbf24 50%, #d4a017 100%)',
+                color: '#0b1320',
+                boxShadow: '0 0 8px rgba(250,204,21,0.4)',
+                letterSpacing: '0.08em',
+              }}
+            >
+              NEW
+            </span>
           </Link>
         </div>
       )}

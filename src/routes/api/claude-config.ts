@@ -1,6 +1,6 @@
 /**
  * Hermes Config API — read/write ~/.hermes/config.yaml and ~/.hermes/.env
- * Gives the web UI the same config power as `claude setup`
+ * Gives the web UI the same config power as `hermes setup`
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -77,7 +77,7 @@ const PROVIDERS = [
     id: 'custom',
     name: 'Custom OpenAI-compatible',
     authType: 'api_key',
-    envKeys: [],
+    envKeys: ['CUSTOM_API_KEY'],
   },
 ]
 
@@ -305,7 +305,7 @@ export const Route = createFileRoute('/api/claude-config')({
 
         return Response.json({
           ok: true,
-          message: 'Config updated. Restart Claude to apply changes.',
+          message: 'Config updated. Restart Hermes Agent to apply changes.',
         })
       },
     },

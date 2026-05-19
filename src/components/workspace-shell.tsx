@@ -21,7 +21,7 @@ import {
   useState,
 } from 'react'
 import { useNavigate, useRouterState } from '@tanstack/react-router'
-import type { AuthStatus } from '@/lib/claude-auth'
+import { fetchClaudeAuthStatus, type AuthStatus } from '@/lib/claude-auth'
 import { cn } from '@/lib/utils'
 import { ConnectionStartupScreen } from '@/components/connection-startup-screen'
 import { ChatSidebar } from '@/screens/chat/components/chat-sidebar'
@@ -39,7 +39,7 @@ import { MobilePageHeader } from '@/components/mobile-page-header'
 import { MobileTerminalInput } from '@/components/terminal/mobile-terminal-input'
 import { ClaudeReconnectBanner } from '@/components/claude-reconnect-banner'
 import { useMobileKeyboard } from '@/hooks/use-mobile-keyboard'
-// System metrics footer removed — not used in Hermes Workspace
+import { SystemMetricsFooter } from '@/components/system-metrics-footer'
 import { CommandPalette } from '@/components/command-palette'
 import { useSettings } from '@/hooks/use-settings'
 // ActivityTicker moved to dashboard-only (too noisy for global header)
@@ -61,6 +61,9 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
   const navigate = useNavigate()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
+  })
+  const search = useRouterState({
+    select: (state) => state.location.search,
   })
   const isElectron = useMemo(
     () =>
@@ -98,8 +101,9 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
     if (path === '/swarm' || path.startsWith('/swarm2')) return 5
     if (path.startsWith('/memory')) return 6
     if (path.startsWith('/skills')) return 7
-    if (path.startsWith('/profiles')) return 8
-    if (path.startsWith('/settings')) return 9
+    if (path.startsWith('/mcp')) return 8
+    if (path.startsWith('/profiles')) return 9
+    if (path.startsWith('/settings')) return 10
     return -1
   }, [])
 
@@ -120,6 +124,47 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
     setConnectionVerified(true)
   }, [])
 
+  // Fallback startup verification in the shell itself.
+  // This prevents a bad loading loop if the splash component gets stuck even
+  // though /api/auth-check or /api/connection-status are already healthy.
+  useEffect(() => {
+    if (typeof window === 'undefined' || connectionVerified) return
+    let cancelled = false
+
+    const verify = async () => {
+      try {
+        const status = await fetchClaudeAuthStatus(3000)
+        if (cancelled) return
+        setAuthStatus(status)
+        setConnectionVerified(true)
+        return
+      } catch {
+        // Fall through to connection-status as a looser readiness signal.
+      }
+
+      try {
+        const res = await fetch('/api/connection-status', { cache: 'no-store' })
+        if (!res.ok || cancelled) return
+        const data = (await res.json()) as {
+          ok?: boolean
+          chatReady?: boolean
+          modelConfigured?: boolean
+        }
+        if (data?.ok || (data?.chatReady && data?.modelConfigured)) {
+          setAuthStatus({ authenticated: true, authRequired: false })
+          setConnectionVerified(true)
+        }
+      } catch {
+        // Keep the startup screen if both checks fail.
+      }
+    }
+
+    void verify()
+    return () => {
+      cancelled = true
+    }
+  }, [connectionVerified])
+
   // Derive active session from URL
   const mobilePageTitle = (() => {
     if (pathname.startsWith('/terminal')) return 'Terminal'
@@ -130,6 +175,7 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
     if (pathname.startsWith('/swarm2') || pathname === '/swarm') return 'Swarm'
     if (pathname.startsWith('/memory')) return 'Memory'
     if (pathname.startsWith('/skills')) return 'Skills'
+    if (pathname.startsWith('/mcp')) return 'MCP'
     if (pathname.startsWith('/profiles')) return 'Profiles'
     if (pathname.startsWith('/settings')) return 'Settings'
     if (pathname.startsWith('/debug')) return 'Debug'
@@ -141,9 +187,14 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
   const activeFriendlyId = chatMatch ? chatMatch[1] : 'main'
   const isOnChatRoute = Boolean(chatMatch) || pathname === '/new'
   const isOnTerminalRoute = pathname.startsWith('/terminal')
+  const isOnPlaygroundRoute = pathname === '/playground' || pathname.startsWith('/playground/')
+  const isOnHermesWorldLandingRoute = pathname === '/hermes-world' || pathname.startsWith('/hermes-world/') || pathname === '/world' || pathname.startsWith('/world/')
+  const isEmbeddedSurface =
+    search?.embed === '1' || search?.embed === 'true' || search?.mode === 'embed'
+  const isChromeFreeSurface = isEmbeddedSurface || isOnHermesWorldLandingRoute
   const hideChatSidebar = isOnChatRoute && chatFocusMode
   const showDesktopSidebarBackdrop =
-    !isMobile && !isOnChatRoute && !sidebarCollapsed
+    !isChromeFreeSurface && !isMobile && !isOnChatRoute && !sidebarCollapsed
 
   const isNewChat = activeFriendlyId === 'new'
 
@@ -237,6 +288,13 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
       window.removeEventListener(SIDEBAR_TOGGLE_EVENT, handleToggleEvent)
   }, [isMobile, setSidebarCollapsed, toggleSidebar])
 
+  // Public/launch surfaces should behave like normal web pages, not app-shell panes.
+  // This keeps /hermes-world and /world scrollable at the document level and avoids
+  // local-only workspace chrome for X/GitHub traffic.
+  if (isChromeFreeSurface) {
+    return <>{children}</>
+  }
+
   // Show login screen if auth is required and not authenticated
   if (authState.authRequired && !authState.authenticated) {
     return <LoginScreen />
@@ -284,12 +342,12 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
         <div
           className={cn(
             'grid h-full grid-cols-1 grid-rows-[minmax(0,1fr)] overflow-hidden',
-            hideChatSidebar ? 'md:grid-cols-1' : 'md:grid-cols-[auto_1fr]',
+            hideChatSidebar || isChromeFreeSurface ? 'md:grid-cols-1' : 'md:grid-cols-[auto_1fr]',
           )}
         >
           {/* Activity ticker bar */}
           {/* Persistent sidebar */}
-          {!isMobile && !hideChatSidebar && (
+          {!isChromeFreeSurface && !isMobile && !hideChatSidebar && (
             <div className="relative z-30">
               <ChatSidebar
                 sessions={sessions}
@@ -319,9 +377,10 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
               isMobile && !isOnChatRoute
                 ? 'pb-[calc(var(--tabbar-h,0px)+0.5rem)]'
                 : !isMobile &&
+                    !isChromeFreeSurface &&
                     !isOnChatRoute &&
                     settings.showSystemMetricsFooter
-                  ? 'pb-[calc(1.5rem+1.75rem)]'
+                  ? 'pb-7'
                   : '',
             ].join(' ')}
             data-tour="chat-area"
@@ -356,7 +415,8 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
 
             <div
               className={[
-                'page-transition h-full flex flex-col',
+                'page-transition flex flex-col',
+                isChromeFreeSurface ? 'min-h-full' : 'h-full',
                 slideClass,
                 isOnTerminalRoute ? 'hidden' : '',
               ]
@@ -364,6 +424,7 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
                 .join(' ')}
             >
               {isMobile &&
+                !isChromeFreeSurface &&
                 !isOnChatRoute &&
                 !isOnTerminalRoute &&
                 mobilePageTitle && <MobilePageHeader title={mobilePageTitle} />}
@@ -371,12 +432,12 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
             </div>
           </main>
 
-          {/* Chat panel — visible on non-chat routes */}
-          {!isOnChatRoute && !isMobile && <ChatPanel />}
+          {/* Chat panel — visible on non-chat routes (but not in HermesWorld, which has its own in-game chat) */}
+          {!isOnChatRoute && !isOnPlaygroundRoute && !isChromeFreeSurface && !isMobile && <ChatPanel />}
         </div>
 
-        {/* Floating chat toggle — visible on non-chat routes */}
-        {!isOnChatRoute && !isMobile && <ChatPanelToggle />}
+        {/* Floating chat toggle — visible on non-chat routes (but not in HermesWorld) */}
+        {!isChromeFreeSurface && !isOnChatRoute && !isOnPlaygroundRoute && !isMobile && <ChatPanelToggle />}
 
         {showDesktopSidebarBackdrop ? (
           <button
@@ -392,9 +453,11 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
         ) : null}
       </div>
 
-      <MobileHamburgerMenu />
-      {/* System metrics footer removed */}
-      <CommandPalette pathname={pathname} sessions={sessions} />
+      {!isChromeFreeSurface ? <MobileHamburgerMenu /> : null}
+      {!isChromeFreeSurface && !isMobile && !isOnChatRoute && settings.showSystemMetricsFooter ? (
+        <SystemMetricsFooter leftOffsetPx={sidebarCollapsed ? 48 : 300} />
+      ) : null}
+      {!isChromeFreeSurface ? <CommandPalette pathname={pathname} sessions={sessions} /> : null}
     </>
   )
 }

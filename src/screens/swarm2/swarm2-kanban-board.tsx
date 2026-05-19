@@ -10,7 +10,7 @@ type SwarmKanbanCard = {
   id: string
   title: string
   spec: string
-  acceptanceCriteria: string[]
+  acceptanceCriteria: Array<string>
   assignedWorker: string | null
   reviewer: string | null
   status: KanbanLane
@@ -28,7 +28,7 @@ type KanbanWorker = {
 }
 
 type KanbanBackendMeta = {
-  id: 'local' | 'claude'
+  id: 'local' | 'claude' | 'hermes-proxy'
   label: string
   detected: boolean
   writable: boolean
@@ -52,10 +52,22 @@ type Swarm2KanbanBoardProps = {
 
 type KanbanBackendPresentation = {
   badgeLabel: string
-  badgeTone: 'claude' | 'local' | 'unknown'
+  badgeTone: 'hermes-proxy' | 'claude' | 'local' | 'unknown'
   toastTitle: string
   toastBody: string
   title: string | undefined
+  /** When set, the badge becomes a deep-link to a dashboard that is safe/reachable from the current browser. */
+  dashboardUrl?: string
+}
+
+function isLoopbackDashboardUrl(value: string | null | undefined): boolean {
+  if (!value) return false
+  try {
+    const url = new URL(value)
+    return ['127.0.0.1', 'localhost', '::1'].includes(url.hostname)
+  } catch {
+    return false
+  }
 }
 
 export function getKanbanBackendPresentation(backend: KanbanBackendMeta | null | undefined): KanbanBackendPresentation {
@@ -66,6 +78,30 @@ export function getKanbanBackendPresentation(backend: KanbanBackendMeta | null |
       toastTitle: 'Detecting Swarm Board backend',
       toastBody: 'Checking Hermes Kanban before falling back locally.',
       title: undefined,
+    }
+  }
+  if (backend.id === 'hermes-proxy' && backend.detected) {
+    // Backend.path is the dashboard origin. Do not deep-link to loopback
+    // origins (127.0.0.1/localhost): in a remote browser that points at the
+    // user's own device, not the VPS. The board still syncs via Workspace's
+    // server-side proxy, so the safe UI is to show a non-clickable status.
+    const dashboardUrl =
+      typeof backend.path === 'string' &&
+      backend.path.startsWith('http') &&
+      !isLoopbackDashboardUrl(backend.path)
+        ? `${backend.path.replace(/\/+$/, '')}/kanban`
+        : undefined
+    return {
+      badgeLabel: 'Synced • Hermes',
+      badgeTone: 'hermes-proxy',
+      toastTitle: 'Synced with Hermes Dashboard',
+      toastBody:
+        'Cards and status changes round-trip through the Hermes Dashboard kanban plugin. Single source of truth, dispatcher-aware.',
+      title:
+        backend.details ??
+        backend.path ??
+        'Hermes Dashboard kanban plugin detected',
+      dashboardUrl,
     }
   }
   if (backend.id === 'claude' && backend.detected) {
@@ -117,7 +153,7 @@ async function fetchKanbanCards(): Promise<{ cards: Array<SwarmKanbanCard>; back
 async function createKanbanCard(input: {
   title: string
   spec: string
-  acceptanceCriteria: string[]
+  acceptanceCriteria: Array<string>
   assignedWorker: string | null
   reviewer: string | null
   status: KanbanLane
@@ -144,7 +180,7 @@ async function updateKanbanCard(id: string, updates: Partial<SwarmKanbanCard>): 
   return data.card
 }
 
-function splitCriteria(value: string): string[] {
+function splitCriteria(value: string): Array<string> {
   return value
     .split('\n')
     .map((line) => line.replace(/^[-*]\s*/, '').trim())
@@ -177,11 +213,15 @@ export function Swarm2KanbanBoard({
   const [backendToast, setBackendToast] = useState<KanbanBackendPresentation | null>(null)
   const lastToastedBackendKey = useRef<string | null>(null)
 
+  // Poll every 5s so cards added/moved on the Hermes Dashboard appear here
+  // without a manual refresh. The Hermes plugin also exposes a WebSocket
+  // (/api/plugins/kanban/events) for true live updates; wiring that in is
+  // the next step on the v2.3.0 kanban roadmap.
   const query = useQuery({
     queryKey: ['swarm2', 'kanban'],
     queryFn: fetchKanbanCards,
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 5_000,
+    staleTime: 2_000,
   })
 
   const backend = query.data?.backend ?? null
@@ -261,24 +301,54 @@ export function Swarm2KanbanBoard({
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--theme-muted)]">
           <span className="rounded-full border border-[var(--theme-border)] bg-[var(--theme-bg)] px-2 py-1">{total} cards</span>
-          <span
-            className={cn(
-              'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-medium',
-              backendPresentation.badgeTone === 'claude'
-                ? 'border-violet-400/40 bg-violet-500/10 text-violet-700'
-                : backendPresentation.badgeTone === 'local'
-                  ? 'border-amber-400/40 bg-amber-500/10 text-amber-700'
-                  : 'border-[var(--theme-border)] bg-[var(--theme-bg)] text-[var(--theme-muted)]',
-            )}
-            title={backendPresentation.title}
-            aria-live="polite"
-          >
-            <span className={cn(
-              'h-1.5 w-1.5 rounded-full',
-              backendPresentation.badgeTone === 'claude' ? 'bg-violet-500' : backendPresentation.badgeTone === 'local' ? 'bg-amber-500' : 'bg-[var(--theme-muted)]',
-            )} />
-            {backendPresentation.badgeLabel}
-          </span>
+          {backendPresentation.dashboardUrl ? (
+            <a
+              href={backendPresentation.dashboardUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-medium transition-colors',
+                'border-emerald-400/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20',
+              )}
+              title={`${backendPresentation.title ?? ''}\nOpen in Hermes Dashboard ↗`}
+              aria-live="polite"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              {backendPresentation.badgeLabel}
+              <span className="opacity-60" aria-hidden="true">
+                ↗
+              </span>
+            </a>
+          ) : (
+            <span
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-full border px-2 py-1 font-medium',
+                backendPresentation.badgeTone === 'hermes-proxy'
+                  ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-700'
+                  : backendPresentation.badgeTone === 'claude'
+                    ? 'border-violet-400/40 bg-violet-500/10 text-violet-700'
+                    : backendPresentation.badgeTone === 'local'
+                      ? 'border-amber-400/40 bg-amber-500/10 text-amber-700'
+                      : 'border-[var(--theme-border)] bg-[var(--theme-bg)] text-[var(--theme-muted)]',
+              )}
+              title={backendPresentation.title}
+              aria-live="polite"
+            >
+              <span
+                className={cn(
+                  'h-1.5 w-1.5 rounded-full',
+                  backendPresentation.badgeTone === 'hermes-proxy'
+                    ? 'bg-emerald-500'
+                    : backendPresentation.badgeTone === 'claude'
+                      ? 'bg-violet-500'
+                      : backendPresentation.badgeTone === 'local'
+                        ? 'bg-amber-500'
+                        : 'bg-[var(--theme-muted)]',
+                )}
+              />
+              {backendPresentation.badgeLabel}
+            </span>
+          )}
           <span className="rounded-full border border-[var(--theme-border)] bg-[var(--theme-bg)] px-2 py-1">{reviewCount} review</span>
           <span className="rounded-full border border-[var(--theme-border)] bg-[var(--theme-bg)] px-2 py-1">{blockedCount} blocked</span>
           <button
