@@ -281,6 +281,9 @@ export const Route = createFileRoute('/api/models')({
             ensureProviderInConfig(m.provider)
           }
 
+          // Build a deduplication set from models already collected
+          const existingIds = new Set<string>(models.map((m) => m.id))
+
           // Merge OpenCode Go models from membership API
           const opencodeModels = await fetchOpenCodeGoModels()
           for (const m of opencodeModels) {
